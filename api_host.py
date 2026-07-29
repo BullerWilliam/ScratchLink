@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from html.parser import HTMLParser
 import re
 import urllib.error
 import urllib.request
@@ -21,7 +22,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
-from urllib.parse import quote, urlencode, urlparse, unquote
+from urllib.parse import parse_qs, quote, urlencode, urlparse, unquote
 
 import mss
 import mss.tools
@@ -358,6 +359,51 @@ def parse_headers_json(value: str) -> dict[str, str]:
     return {str(key): str(item) for key, item in parsed.items()}
 
 
+class GoogleResultLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attr_map = {str(key).lower(): value for key, value in attrs}
+        href = str(attr_map.get("href") or "").strip()
+        if href:
+            self.links.append(href)
+
+
+def extract_google_result_links(html: str) -> list[str]:
+    parser = GoogleResultLinkParser()
+    parser.feed(str(html or ""))
+
+    extracted: list[str] = []
+    seen: set[str] = set()
+
+    for href in parser.links:
+        candidate = href
+        parsed_href = urlparse(href)
+        if href.startswith("/url?"):
+            parsed_query = parse_qs(parsed_href.query)
+            candidate = parsed_query.get("q", parsed_query.get("url", [""]))[0]
+        elif href.startswith("/imgres?"):
+            parsed_query = parse_qs(parsed_href.query)
+            candidate = parsed_query.get("imgurl", [""])[0]
+
+        candidate = unquote(str(candidate or "")).strip()
+        lowered = candidate.lower()
+        if not lowered.startswith(("http://", "https://")):
+            continue
+        if "google.com" in lowered or "googleusercontent.com" in lowered:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        extracted.append(candidate)
+
+    return extracted
+
+
 def perform_outbound_http_request(method: str, url: str, headers: dict[str, str], body: str = "") -> dict[str, Any]:
     cleaned_method = str(method or "").strip().upper()
     cleaned_url = str(url or "").strip()
@@ -407,7 +453,9 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
 
     params: dict[str, str | int] = {
         "hl": "en",
-        "num": 10,
+        "gbv": 1,
+        "num": 100,
+        "filter": 0,
         "q": cleaned_text,
     }
 
@@ -434,7 +482,6 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
 
     found_links: list[str] = []
     seen_links: set[str] = set()
-    result_pattern = re.compile(r'href="/url\?q=([^"&]+)')
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -443,37 +490,23 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    for start in range(0, 100, 10):
-        page_params = dict(params)
-        page_params["start"] = start
-        url = f"https://www.google.com/search?{urlencode(page_params)}"
-        request = urllib.request.Request(url, headers=headers, method="GET")
+    url = f"https://www.google.com/search?{urlencode(params)}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
 
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                html = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Google search failed with status {exc.code}.") from exc
-        except urllib.error.URLError as exc:
-            raise HTTPException(status_code=502, detail="ScratchLink could not reach Google search right now.") from exc
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Google search failed with status {exc.code}.") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail="ScratchLink could not reach Google search right now.") from exc
 
-        page_had_new_link = False
-        for raw_link in result_pattern.findall(html):
-            link = unquote(raw_link).strip()
-            lowered = link.lower()
-            if not lowered.startswith(("http://", "https://")):
-                continue
-            if "google.com" in lowered or "googleusercontent.com" in lowered:
-                continue
-            if link in seen_links:
-                continue
-            seen_links.add(link)
-            found_links.append(link)
-            page_had_new_link = True
-            if len(found_links) >= 100:
-                return {"ok": True, "links": found_links}
-
-        if not page_had_new_link and start >= 20:
+    for link in extract_google_result_links(html):
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        found_links.append(link)
+        if len(found_links) >= 100:
             break
 
     return {"ok": True, "links": found_links}
