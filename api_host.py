@@ -1045,7 +1045,7 @@ class ConnectionRenameRequest(BaseModel):
     name: str
 
 
-class ConnectionTokenRequest(BaseModel):
+class ConnectionOpenRouterKeyRequest(BaseModel):
     openrouter_key: str = ""
 
 
@@ -1630,7 +1630,7 @@ def admin_rename_connection(connection_id: str, payload: ConnectionRenameRequest
 
 
 @app.post("/admin/connections/{connection_id}/openrouter-key")
-def admin_set_connection_openrouter_key(connection_id: str, payload: ConnectionTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+def admin_set_connection_openrouter_key(connection_id: str, payload: ConnectionOpenRouterKeyRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     try:
         connection = get_store().set_openrouter_key(connection_id, payload.openrouter_key)
     except KeyError as exc:

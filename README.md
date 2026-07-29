@@ -65,14 +65,14 @@ ScratchLink still runs a local background server, but the app now exposes it thr
 
 ## Hosted AI setup
 
-ScratchLink's AI blocks call a hosted chat model through an OpenAI-compatible endpoint.
+ScratchLink's AI blocks call OpenRouter through an OpenAI-compatible endpoint.
 
 By default the app uses:
 
 - endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - model: `openrouter/free`
 
-Before starting the app, set one of these environment variables:
+You can pass your OpenRouter keys directly into the AI block, or set these environment variables before starting the app:
 
 - `SCRATCHLINK_OPENROUTER_KEY`
 - `SCRATCHLINK_OPENROUTER_BACKUP_KEY`
