@@ -136,7 +136,7 @@ function openMenu(connectionId) {
   elements.menuTitle.textContent = connection.name;
   elements.menuId.textContent = connection.id;
   elements.menuToggleButton.textContent = connection.enabled ? 'Turn Off' : 'Turn On';
-  elements.menuTokenButton.textContent = connection.hasHfToken ? 'Edit HF Token' : 'Add HF Token';
+  elements.menuTokenButton.textContent = connection.hasOpenRouterKey ? 'Edit OpenRouter Key' : 'Add OpenRouter Key';
   elements.menuOverlay.classList.remove('hidden');
 }
 
@@ -395,11 +395,7 @@ async function createConnection() {
   if (name === null) {
     return;
   }
-  const hfToken = window.prompt('Paste a Hugging Face token for this connection. Leave it blank if you want to add it later:', '');
-  if (hfToken === null) {
-    return;
-  }
-  const data = await api('/admin/connections', { method: 'POST', body: { name, hf_token: hfToken } });
+  const data = await api('/admin/connections', { method: 'POST', body: { name } });
   await refreshState();
   await copyText(data.connection.extensionUrl, 'New connection created and connection link copied.');
 }
@@ -426,14 +422,14 @@ async function editMenuToken() {
     showToast('Choose a connection first.');
     return;
   }
-  const hfToken = window.prompt('Paste the Hugging Face token for this connection. Leave it blank to remove it:', connection.hfToken || '');
-  if (hfToken === null) {
+  const openRouterKey = window.prompt('Paste the OpenRouter API key for this connection. Leave it blank to remove it:', connection.openrouterKey || '');
+  if (openRouterKey === null) {
     return;
   }
-  await api(`/admin/connections/${connection.id}/hf-token`, { method: 'POST', body: { hf_token: hfToken } });
+  await api(`/admin/connections/${connection.id}/openrouter-key`, { method: 'POST', body: { openrouter_key: openRouterKey } });
   await refreshState();
   openMenu(connection.id);
-  showToast(hfToken.trim() ? 'HF token updated.' : 'HF token removed.');
+  showToast(openRouterKey.trim() ? 'OpenRouter key updated.' : 'OpenRouter key removed.');
 }
 
 async function toggleMenuConnection() {

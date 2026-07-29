@@ -74,7 +74,7 @@ class ConnectionRecord:
     id: str
     name: str
     password: str
-    hf_token: str
+    openrouter_key: str
     enabled: bool
     created_at: str
     last_used_at: str | None = None
@@ -105,13 +105,13 @@ class ConnectionStore:
                 return candidate
             index += 1
 
-    def create_connection(self, name: str | None = None, hf_token: str | None = None) -> ConnectionRecord:
+    def create_connection(self, name: str | None = None, openrouter_key: str | None = None) -> ConnectionRecord:
         with self._lock:
             connection = ConnectionRecord(
                 id=uuid.uuid4().hex,
                 name=(name or "").strip() or self._default_name_locked(),
                 password=secrets.token_urlsafe(18),
-                hf_token=str(hf_token or "").strip(),
+                openrouter_key=str(openrouter_key or "").strip(),
                 enabled=True,
                 created_at=now_iso(),
             )
@@ -143,12 +143,12 @@ class ConnectionStore:
             connection.name = cleaned
             return ConnectionRecord(**asdict(connection))
 
-    def set_hf_token(self, connection_id: str, hf_token: str) -> ConnectionRecord:
+    def set_openrouter_key(self, connection_id: str, openrouter_key: str) -> ConnectionRecord:
         with self._lock:
             connection = self._connections.get(connection_id)
             if connection is None:
                 raise KeyError(connection_id)
-            connection.hf_token = str(hf_token or "").strip()
+            connection.openrouter_key = str(openrouter_key or "").strip()
             return ConnectionRecord(**asdict(connection))
 
     def toggle_connection(self, connection_id: str) -> ConnectionRecord:
@@ -779,7 +779,7 @@ class HostedAiManager:
         for candidate in (
             str(primary_key or "").strip(),
             str(backup_key or "").strip(),
-            str(connection.hf_token or "").strip(),
+            str(connection.openrouter_key or "").strip(),
             os.environ.get(DEFAULT_AI_TOKEN_ENV, "").strip(),
             os.environ.get(DEFAULT_AI_BACKUP_TOKEN_ENV, "").strip(),
         ):
@@ -1038,7 +1038,7 @@ class BatchRequest(BaseModel):
 
 class ConnectionCreateRequest(BaseModel):
     name: str | None = None
-    hf_token: str = ""
+    openrouter_key: str = ""
 
 
 class ConnectionRenameRequest(BaseModel):
@@ -1046,7 +1046,7 @@ class ConnectionRenameRequest(BaseModel):
 
 
 class ConnectionTokenRequest(BaseModel):
-    hf_token: str = ""
+    openrouter_key: str = ""
 
 
 class HostedDirectoryRequest(BaseModel):
@@ -1222,8 +1222,8 @@ def serialize_connection(connection: ConnectionRecord) -> dict[str, Any]:
         "id": connection.id,
         "name": connection.name,
         "password": connection.password,
-        "hfToken": connection.hf_token,
-        "hasHfToken": bool(str(connection.hf_token or "").strip()),
+        "openrouterKey": connection.openrouter_key,
+        "hasOpenRouterKey": bool(str(connection.openrouter_key or "").strip()),
         "enabled": connection.enabled,
         "createdAt": connection.created_at,
         "lastUsedAt": connection.last_used_at,
@@ -1614,7 +1614,7 @@ def admin_state(_: None = Depends(require_admin)) -> dict[str, Any]:
 
 @app.post("/admin/connections")
 def admin_create_connection(payload: ConnectionCreateRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
-    connection = get_store().create_connection(payload.name, payload.hf_token)
+    connection = get_store().create_connection(payload.name, payload.openrouter_key)
     return {"connection": serialize_connection(connection)}
 
 
@@ -1629,10 +1629,10 @@ def admin_rename_connection(connection_id: str, payload: ConnectionRenameRequest
     return {"connection": serialize_connection(connection)}
 
 
-@app.post("/admin/connections/{connection_id}/hf-token")
-def admin_set_connection_hf_token(connection_id: str, payload: ConnectionTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+@app.post("/admin/connections/{connection_id}/openrouter-key")
+def admin_set_connection_openrouter_key(connection_id: str, payload: ConnectionTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     try:
-        connection = get_store().set_hf_token(connection_id, payload.hf_token)
+        connection = get_store().set_openrouter_key(connection_id, payload.openrouter_key)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
     return {"connection": serialize_connection(connection)}

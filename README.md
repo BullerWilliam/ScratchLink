@@ -69,13 +69,13 @@ ScratchLink's AI blocks call a hosted chat model through an OpenAI-compatible en
 
 By default the app uses:
 
-- endpoint: `https://router.huggingface.co/v1/chat/completions`
-- model: `openai/gpt-oss-120b:fastest`
+- endpoint: `https://openrouter.ai/api/v1/chat/completions`
+- model: `openrouter/free`
 
 Before starting the app, set one of these environment variables:
 
-- `SCRATCHLINK_AI_TOKEN`
-- `HF_TOKEN`
+- `SCRATCHLINK_OPENROUTER_KEY`
+- `SCRATCHLINK_OPENROUTER_BACKUP_KEY`
 
 Optional overrides:
 
@@ -85,7 +85,7 @@ Optional overrides:
 Example on Windows PowerShell:
 
 ```powershell
-$env:SCRATCHLINK_AI_TOKEN="your-token-here"
+$env:SCRATCHLINK_OPENROUTER_KEY="your-key-here"
 python api_host.py
 ```
 
