@@ -1,9 +1,5 @@
 __pycache__/
 *.py[cod]
-.wheel_debug/
-_ai_wheels/
-deps/
-ai_deps/
-hf_cache/
 scratchlink_connections.json
 __pycache__/api_host.cpython-312.pyc
+/deps

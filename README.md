@@ -2,7 +2,7 @@
 
 ScratchLink is a desktop app for PenguinMod and Scratch-style projects that renders its interface with HTML, CSS, and JavaScript inside a Python-powered desktop window while routing its extension and API through a public Cloudflare URL.
 
-The AI blocks use an online hosted model instead of downloading a local model into the app.
+The AI blocks use an online hosted model.
 
 When the app starts, it blocks on setup until Cloudflare Tunnel is available and a public URL is live. After that, the app opens a connection dashboard where every ScratchLink connection has:
 
