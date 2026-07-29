@@ -1,8 +1,6 @@
 import asyncio
 import argparse
 import base64
-import importlib
-import importlib.metadata
 import json
 import os
 import platform
@@ -39,21 +37,6 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LEGACY_LOCAL_DEPS = os.path.join(HERE, "deps")
-sys.path[:] = [path for path in sys.path if os.path.abspath(path) != os.path.abspath(LEGACY_LOCAL_DEPS)]
-LOCAL_PYTHON_DEPS = os.path.join(HERE, "ai_deps")
-if os.path.isdir(LOCAL_PYTHON_DEPS) and LOCAL_PYTHON_DEPS not in sys.path:
-    sys.path.insert(0, LOCAL_PYTHON_DEPS)
-if platform.system() == "Windows" and hasattr(os, "add_dll_directory"):
-    dll_candidates = [
-        LOCAL_PYTHON_DEPS,
-        os.path.join(LOCAL_PYTHON_DEPS, "torch", "lib"),
-    ]
-    for dll_path in dll_candidates:
-        if os.path.isdir(dll_path):
-            with suppress(OSError):
-                os.add_dll_directory(dll_path)
-os.environ.setdefault("HF_HOME", os.path.join(HERE, "hf_cache"))
 EXTENSION_FILE = os.path.join(HERE, "scratchlink_penguinmod.js")
 CONNECTIONS_FILE = os.path.join(HERE, "scratchlink_connections.json")
 TOOLS_DIR = os.path.join(HERE, "tools")
@@ -62,48 +45,10 @@ CLOUDFLARED_FALLBACK_PATH = os.path.join(TOOLS_DIR, "cloudflared.exe")
 CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_AI_MODEL = "google/flan-t5-base"
-
-
-def install_local_metadata_fallback() -> None:
-    if getattr(importlib.metadata, "_scratchlink_local_patch", False):
-        return
-
-    original_version = importlib.metadata.version
-
-    def patched_version(distribution_name: str) -> str:
-        try:
-            discovered = original_version(distribution_name)
-            if discovered:
-                return discovered
-        except importlib.metadata.PackageNotFoundError:
-            pass
-
-        normalized = distribution_name.lower().replace("-", "_")
-        prefix = f"{normalized}-"
-        suffix = ".dist-info"
-
-        with suppress(OSError):
-            for entry in os.listdir(LOCAL_PYTHON_DEPS):
-                entry_name = entry.lower()
-                if entry_name.startswith(prefix) and entry_name.endswith(suffix):
-                    version_text = entry[len(prefix) : -len(suffix)]
-                    if version_text:
-                        return version_text
-
-        with suppress(Exception):
-            module = importlib.import_module(normalized)
-            candidate = getattr(module, "__version__", None)
-            if candidate:
-                return str(candidate)
-
-        raise importlib.metadata.PackageNotFoundError(distribution_name)
-
-    importlib.metadata.version = patched_version
-    importlib.metadata._scratchlink_local_patch = True
-
-
-install_local_metadata_fallback()
+DEFAULT_AI_MODEL = os.environ.get("SCRATCHLINK_AI_MODEL", "openai/gpt-oss-120b:fastest")
+DEFAULT_AI_ENDPOINT = os.environ.get("SCRATCHLINK_AI_ENDPOINT", "https://router.huggingface.co/v1/chat/completions")
+DEFAULT_AI_TOKEN_ENV = "SCRATCHLINK_AI_TOKEN"
+DEFAULT_HF_TOKEN_ENV = "HF_TOKEN"
 
 
 def now_iso() -> str:
@@ -863,33 +808,47 @@ class ScreenManager:
             }
 
 
-class LocalAiManager:
-    def __init__(self, model_id: str = DEFAULT_AI_MODEL):
+class HostedAiManager:
+    def __init__(self, model_id: str = DEFAULT_AI_MODEL, endpoint: str = DEFAULT_AI_ENDPOINT):
         self.model_id = model_id
+        self.endpoint = endpoint
         self._lock = threading.RLock()
-        self._tokenizer = None
-        self._model = None
 
-    def _ensure_loaded_locked(self) -> None:
-        if self._tokenizer is not None and self._model is not None:
-            return
+    def _get_token(self) -> str:
+        token = os.environ.get(DEFAULT_AI_TOKEN_ENV, "").strip()
+        if token:
+            return token
 
-        try:
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-        except ImportError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail="ScratchLink AI is not installed yet. Install the Python requirements and try again.",
-            ) from exc
+        fallback_token = os.environ.get(DEFAULT_HF_TOKEN_ENV, "").strip()
+        if fallback_token:
+            return fallback_token
 
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_id)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"ScratchLink could not load the local AI model ({self.model_id}).",
-            ) from exc
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ScratchLink AI is not configured yet. "
+                f"Set {DEFAULT_AI_TOKEN_ENV} or {DEFAULT_HF_TOKEN_ENV} and restart the app."
+            ),
+        )
+
+    def _extract_text(self, payload: dict[str, Any]) -> str:
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(str(item.get("text", "")))
+                return "".join(text_parts).strip()
+
+        if isinstance(payload.get("generated_text"), str):
+            return str(payload["generated_text"]).strip()
+
+        return ""
 
     def generate(self, prompt: str, instructions: str = "", json_format: str = "") -> dict[str, Any]:
         cleaned_prompt = str(prompt or "").strip()
@@ -899,49 +858,76 @@ class LocalAiManager:
         cleaned_instructions = str(instructions or "").strip()
         cleaned_json_format = str(json_format or "").strip()
 
+        system_parts = []
+        if cleaned_instructions:
+            system_parts.append(cleaned_instructions)
+        else:
+            system_parts.append("Be helpful, concise, and follow the user's instructions carefully.")
+        if cleaned_json_format:
+            system_parts.append(
+                "Respond with only a valid JSON object and no extra text. "
+                f"The JSON must match this format: {cleaned_json_format}"
+            )
+
+        request_payload = {
+            "model": self.model_id,
+            "messages": [
+                {"role": "system", "content": "\n".join(system_parts)},
+                {"role": "user", "content": cleaned_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 300,
+            "stream": False,
+        }
+
+        request_bytes = json.dumps(request_payload).encode("utf-8")
+        request_headers = {
+            "Authorization": f"Bearer {self._get_token()}",
+            "Content-Type": "application/json",
+        }
+        request = urllib.request.Request(
+            self.endpoint,
+            data=request_bytes,
+            headers=request_headers,
+            method="POST",
+        )
+
         with self._lock:
-            self._ensure_loaded_locked()
-            tokenizer = self._tokenizer
-            model = self._model
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    raw_body = response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                detail = "ScratchLink AI request failed."
+                with suppress(json.JSONDecodeError):
+                    error_payload = json.loads(body)
+                    if isinstance(error_payload, dict):
+                        error_block = error_payload.get("error")
+                        if isinstance(error_block, dict) and error_block.get("message"):
+                            detail = str(error_block["message"])
+                        elif error_payload.get("message"):
+                            detail = str(error_payload["message"])
+                raise HTTPException(status_code=502, detail=f"ScratchLink AI request failed: {detail}") from exc
+            except urllib.error.URLError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="ScratchLink could not reach the hosted AI service right now.",
+                ) from exc
 
-            system_parts = []
-            if cleaned_instructions:
-                system_parts.append(cleaned_instructions)
-            else:
-                system_parts.append("Be helpful, concise, and follow the user's instructions carefully.")
-            if cleaned_json_format:
-                system_parts.append(
-                    "Respond with only a valid JSON object and no extra text. "
-                    f"The JSON must match this format: {cleaned_json_format}"
-                )
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="ScratchLink AI returned an invalid response.") from exc
 
-            combined_prompt = (
-                "Instructions:\n"
-                + "\n".join(system_parts)
-                + "\n\nUser prompt:\n"
-                + cleaned_prompt
-                + "\n\nResponse:"
-            )
+        response_text = self._extract_text(payload)
+        if not response_text:
+            raise HTTPException(status_code=502, detail="ScratchLink AI returned an empty response.")
 
-            inputs = tokenizer(
-                combined_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=768,
-            )
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                do_sample=False,
-                num_beams=4,
-                early_stopping=True,
-            )
-            response_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-            return {
-                "ok": True,
-                "model": self.model_id,
-                "text": response_text,
-            }
+        return {
+            "ok": True,
+            "model": self.model_id,
+            "text": response_text,
+        }
 
 
 class RuntimeState:
@@ -953,7 +939,7 @@ class RuntimeState:
         self.admin_token = secrets.token_urlsafe(24)
         self.directory_host = DirectoryHost()
         self.screen_manager = ScreenManager()
-        self.ai_manager = LocalAiManager()
+        self.ai_manager = HostedAiManager()
 
     def require_store(self) -> ConnectionStore:
         if self.store is None:

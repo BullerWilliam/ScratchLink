@@ -2,6 +2,8 @@
 
 ScratchLink is a desktop app for PenguinMod and Scratch-style projects that renders its interface with HTML, CSS, and JavaScript inside a Python-powered desktop window while routing its extension and API through a public Cloudflare URL.
 
+The AI blocks use an online hosted model instead of downloading a local model into the app.
+
 When the app starts, it blocks on setup until Cloudflare Tunnel is available and a public URL is live. After that, the app opens a connection dashboard where every ScratchLink connection has:
 
 - its own name
@@ -37,6 +39,7 @@ Every action from the extension is verified against that connection's ID and pas
 - Python 3.11 or newer is recommended
 - Windows is the main target right now
 - internet access is needed when the app is downloading Cloudflare Tunnel or opening the public URL
+- internet access is also needed for the AI blocks because they call a hosted AI model
 
 Install dependencies with:
 
@@ -59,6 +62,32 @@ python api_host.py --host 127.0.0.1 --port 8765
 ```
 
 ScratchLink still runs a local background server, but the app now exposes it through Cloudflare and gives you a public URL for actual use.
+
+## Hosted AI setup
+
+ScratchLink's AI blocks call a hosted chat model through an OpenAI-compatible endpoint.
+
+By default the app uses:
+
+- endpoint: `https://router.huggingface.co/v1/chat/completions`
+- model: `openai/gpt-oss-120b:fastest`
+
+Before starting the app, set one of these environment variables:
+
+- `SCRATCHLINK_AI_TOKEN`
+- `HF_TOKEN`
+
+Optional overrides:
+
+- `SCRATCHLINK_AI_MODEL`
+- `SCRATCHLINK_AI_ENDPOINT`
+
+Example on Windows PowerShell:
+
+```powershell
+$env:SCRATCHLINK_AI_TOKEN="your-token-here"
+python api_host.py
+```
 
 ## Startup flow
 
@@ -141,6 +170,7 @@ The app publishes the API through its Cloudflare URL and also exposes docs at:
 Main API areas include:
 
 - health and connection checks
+- hosted AI generation
 - screen capture and monitor info
 - mouse actions
 - keyboard actions
@@ -155,6 +185,7 @@ Main API areas include:
 - `PyAutoGUI` fail-safe is disabled in the current host code
 - regenerating a password invalidates the old extension link for that connection
 - the local background server still exists, but the app is designed to share only the Cloudflare URL outward
+- AI replies depend on your configured hosted provider and internet access
 
 ## Safety
 

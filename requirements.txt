@@ -3,7 +3,4 @@ mss
 pyautogui
 pydantic
 pywebview
-sentencepiece
-torch
-transformers
 uvicorn
