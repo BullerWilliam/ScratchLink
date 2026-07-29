@@ -1,6 +1,8 @@
 import asyncio
 import argparse
 import base64
+import importlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -37,9 +39,20 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOCAL_PYTHON_DEPS = os.path.join(HERE, "deps")
+LEGACY_LOCAL_DEPS = os.path.join(HERE, "deps")
+sys.path[:] = [path for path in sys.path if os.path.abspath(path) != os.path.abspath(LEGACY_LOCAL_DEPS)]
+LOCAL_PYTHON_DEPS = os.path.join(HERE, "ai_deps")
 if os.path.isdir(LOCAL_PYTHON_DEPS) and LOCAL_PYTHON_DEPS not in sys.path:
     sys.path.insert(0, LOCAL_PYTHON_DEPS)
+if platform.system() == "Windows" and hasattr(os, "add_dll_directory"):
+    dll_candidates = [
+        LOCAL_PYTHON_DEPS,
+        os.path.join(LOCAL_PYTHON_DEPS, "torch", "lib"),
+    ]
+    for dll_path in dll_candidates:
+        if os.path.isdir(dll_path):
+            with suppress(OSError):
+                os.add_dll_directory(dll_path)
 os.environ.setdefault("HF_HOME", os.path.join(HERE, "hf_cache"))
 EXTENSION_FILE = os.path.join(HERE, "scratchlink_penguinmod.js")
 CONNECTIONS_FILE = os.path.join(HERE, "scratchlink_connections.json")
@@ -50,6 +63,47 @@ CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/l
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_AI_MODEL = "google/flan-t5-base"
+
+
+def install_local_metadata_fallback() -> None:
+    if getattr(importlib.metadata, "_scratchlink_local_patch", False):
+        return
+
+    original_version = importlib.metadata.version
+
+    def patched_version(distribution_name: str) -> str:
+        try:
+            discovered = original_version(distribution_name)
+            if discovered:
+                return discovered
+        except importlib.metadata.PackageNotFoundError:
+            pass
+
+        normalized = distribution_name.lower().replace("-", "_")
+        prefix = f"{normalized}-"
+        suffix = ".dist-info"
+
+        with suppress(OSError):
+            for entry in os.listdir(LOCAL_PYTHON_DEPS):
+                entry_name = entry.lower()
+                if entry_name.startswith(prefix) and entry_name.endswith(suffix):
+                    version_text = entry[len(prefix) : -len(suffix)]
+                    if version_text:
+                        return version_text
+
+        with suppress(Exception):
+            module = importlib.import_module(normalized)
+            candidate = getattr(module, "__version__", None)
+            if candidate:
+                return str(candidate)
+
+        raise importlib.metadata.PackageNotFoundError(distribution_name)
+
+    importlib.metadata.version = patched_version
+    importlib.metadata._scratchlink_local_patch = True
+
+
+install_local_metadata_fallback()
 
 
 def now_iso() -> str:
