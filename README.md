@@ -181,7 +181,7 @@ Main API areas include:
 
 ## Notes
 
-- connection data is stored locally in `scratchlink_connections.json`
+- connection data lives only in memory while the app is running
 - `PyAutoGUI` fail-safe is disabled in the current host code
 - regenerating a password invalidates the old extension link for that connection
 - the local background server still exists, but the app is designed to share only the Cloudflare URL outward

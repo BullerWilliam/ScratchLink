@@ -38,7 +38,6 @@ pyautogui.PAUSE = 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXTENSION_FILE = os.path.join(HERE, "scratchlink_penguinmod.js")
-CONNECTIONS_FILE = os.path.join(HERE, "scratchlink_connections.json")
 TOOLS_DIR = os.path.join(HERE, "tools")
 UI_DIR = os.path.join(HERE, "ui")
 CLOUDFLARED_FALLBACK_PATH = os.path.join(TOOLS_DIR, "cloudflared.exe")
@@ -75,60 +74,16 @@ class ConnectionRecord:
     id: str
     name: str
     password: str
+    hf_token: str
     enabled: bool
     created_at: str
     last_used_at: str | None = None
 
 
 class ConnectionStore:
-    def __init__(self, storage_path: str):
-        self.storage_path = storage_path
+    def __init__(self):
         self._lock = threading.RLock()
         self._connections: dict[str, ConnectionRecord] = {}
-        self.load()
-
-    def load(self) -> None:
-        with self._lock:
-            if not os.path.exists(self.storage_path):
-                self._connections = {}
-                return
-
-            try:
-                with open(self.storage_path, "r", encoding="utf-8") as handle:
-                    raw = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                self._connections = {}
-                return
-
-            if not isinstance(raw, list):
-                self._connections = {}
-                return
-
-            loaded: dict[str, ConnectionRecord] = {}
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                connection_id = str(item.get("id", "")).strip()
-                name = str(item.get("name", "")).strip()
-                password = str(item.get("password", "")).strip()
-                created_at = str(item.get("created_at", "")).strip() or now_iso()
-                if not connection_id or not name or not password:
-                    continue
-                loaded[connection_id] = ConnectionRecord(
-                    id=connection_id,
-                    name=name,
-                    password=password,
-                    enabled=bool(item.get("enabled", True)),
-                    created_at=created_at,
-                    last_used_at=str(item.get("last_used_at") or "").strip() or None,
-                )
-            self._connections = loaded
-
-    def save(self) -> None:
-        with self._lock:
-            payload = [asdict(connection) for connection in self._sorted_connections_locked()]
-            with open(self.storage_path, "w", encoding="utf-8", newline="") as handle:
-                json.dump(payload, handle, indent=2)
 
     def _sorted_connections_locked(self) -> list[ConnectionRecord]:
         return sorted(self._connections.values(), key=lambda item: (item.created_at, item.name.casefold()))
@@ -150,17 +105,17 @@ class ConnectionStore:
                 return candidate
             index += 1
 
-    def create_connection(self, name: str | None = None) -> ConnectionRecord:
+    def create_connection(self, name: str | None = None, hf_token: str | None = None) -> ConnectionRecord:
         with self._lock:
             connection = ConnectionRecord(
                 id=uuid.uuid4().hex,
                 name=(name or "").strip() or self._default_name_locked(),
                 password=secrets.token_urlsafe(18),
+                hf_token=str(hf_token or "").strip(),
                 enabled=True,
                 created_at=now_iso(),
             )
             self._connections[connection.id] = connection
-            self.save()
             return ConnectionRecord(**asdict(connection))
 
     def get(self, connection_id: str) -> ConnectionRecord | None:
@@ -186,7 +141,14 @@ class ConnectionStore:
             if connection is None:
                 raise KeyError(connection_id)
             connection.name = cleaned
-            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+    def set_hf_token(self, connection_id: str, hf_token: str) -> ConnectionRecord:
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                raise KeyError(connection_id)
+            connection.hf_token = str(hf_token or "").strip()
             return ConnectionRecord(**asdict(connection))
 
     def toggle_connection(self, connection_id: str) -> ConnectionRecord:
@@ -195,7 +157,6 @@ class ConnectionStore:
             if connection is None:
                 raise KeyError(connection_id)
             connection.enabled = not connection.enabled
-            self.save()
             return ConnectionRecord(**asdict(connection))
 
     def regenerate_password(self, connection_id: str) -> ConnectionRecord:
@@ -204,7 +165,6 @@ class ConnectionStore:
             if connection is None:
                 raise KeyError(connection_id)
             connection.password = secrets.token_urlsafe(18)
-            self.save()
             return ConnectionRecord(**asdict(connection))
 
     def delete_connection(self, connection_id: str) -> None:
@@ -212,7 +172,6 @@ class ConnectionStore:
             if connection_id not in self._connections:
                 raise KeyError(connection_id)
             del self._connections[connection_id]
-            self.save()
 
     def authenticate(self, connection_id: str | None, password: str | None) -> ConnectionRecord:
         if not connection_id or not password:
@@ -227,7 +186,6 @@ class ConnectionStore:
             if not secrets.compare_digest(connection.password, password):
                 raise HTTPException(status_code=403, detail="ScratchLink password was rejected")
             connection.last_used_at = now_iso()
-            self.save()
             return ConnectionRecord(**asdict(connection))
 
 
@@ -814,7 +772,11 @@ class HostedAiManager:
         self.endpoint = endpoint
         self._lock = threading.RLock()
 
-    def _get_token(self) -> str:
+    def _get_token(self, connection: ConnectionRecord) -> str:
+        token = str(connection.hf_token or "").strip()
+        if token:
+            return token
+
         token = os.environ.get(DEFAULT_AI_TOKEN_ENV, "").strip()
         if token:
             return token
@@ -827,7 +789,8 @@ class HostedAiManager:
             status_code=503,
             detail=(
                 "ScratchLink AI is not configured yet. "
-                f"Set {DEFAULT_AI_TOKEN_ENV} or {DEFAULT_HF_TOKEN_ENV} and restart the app."
+                "Add a Hugging Face token to this connection or set "
+                f"{DEFAULT_AI_TOKEN_ENV} or {DEFAULT_HF_TOKEN_ENV} and restart the app."
             ),
         )
 
@@ -850,7 +813,7 @@ class HostedAiManager:
 
         return ""
 
-    def generate(self, prompt: str, instructions: str = "", json_format: str = "") -> dict[str, Any]:
+    def generate(self, connection: ConnectionRecord, prompt: str, instructions: str = "", json_format: str = "") -> dict[str, Any]:
         cleaned_prompt = str(prompt or "").strip()
         if not cleaned_prompt:
             raise HTTPException(status_code=400, detail="An AI prompt is required")
@@ -882,7 +845,7 @@ class HostedAiManager:
 
         request_bytes = json.dumps(request_payload).encode("utf-8")
         request_headers = {
-            "Authorization": f"Bearer {self._get_token()}",
+            "Authorization": f"Bearer {self._get_token(connection)}",
             "Content-Type": "application/json",
         }
         request = urllib.request.Request(
@@ -1024,10 +987,15 @@ class BatchRequest(BaseModel):
 
 class ConnectionCreateRequest(BaseModel):
     name: str | None = None
+    hf_token: str = ""
 
 
 class ConnectionRenameRequest(BaseModel):
     name: str
+
+
+class ConnectionTokenRequest(BaseModel):
+    hf_token: str = ""
 
 
 class HostedDirectoryRequest(BaseModel):
@@ -1201,6 +1169,8 @@ def serialize_connection(connection: ConnectionRecord) -> dict[str, Any]:
         "id": connection.id,
         "name": connection.name,
         "password": connection.password,
+        "hfToken": connection.hf_token,
+        "hasHfToken": bool(str(connection.hf_token or "").strip()),
         "enabled": connection.enabled,
         "createdAt": connection.created_at,
         "lastUsedAt": connection.last_used_at,
@@ -1591,7 +1561,7 @@ def admin_state(_: None = Depends(require_admin)) -> dict[str, Any]:
 
 @app.post("/admin/connections")
 def admin_create_connection(payload: ConnectionCreateRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
-    connection = get_store().create_connection(payload.name)
+    connection = get_store().create_connection(payload.name, payload.hf_token)
     return {"connection": serialize_connection(connection)}
 
 
@@ -1603,6 +1573,15 @@ def admin_rename_connection(connection_id: str, payload: ConnectionRenameRequest
         raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"connection": serialize_connection(connection)}
+
+
+@app.post("/admin/connections/{connection_id}/hf-token")
+def admin_set_connection_hf_token(connection_id: str, payload: ConnectionTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        connection = get_store().set_hf_token(connection_id, payload.hf_token)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
     return {"connection": serialize_connection(connection)}
 
 
@@ -1804,8 +1783,7 @@ def outbound_http_post(payload: OutboundHttpRequest, connection: ConnectionRecor
 
 @app.post("/ai/generate")
 def ai_generate(payload: AiGenerateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
-    _ = connection
-    return STATE.ai_manager.generate(payload.prompt, payload.instructions, payload.json_format)
+    return STATE.ai_manager.generate(connection, payload.prompt, payload.instructions, payload.json_format)
 
 
 @app.get("/screen/buttons")
@@ -2903,7 +2881,6 @@ class ScratchLinkApp(ttk.Frame):
         )
 
     def on_close(self) -> None:
-        self.store.save()
         self.root.destroy()
 
 
@@ -3027,7 +3004,7 @@ def bootstrap_webview(window: webview.Window, host: str, port: int) -> tuple[Loc
     update_loading_window(window, "Checking Cloudflare Tunnel...", "ScratchLink is making sure the tunnel tool is ready.")
     cloudflared_path = ensure_cloudflared(lambda message: update_loading_window(window, "Preparing Cloudflare Tunnel...", message))
 
-    STATE.store = ConnectionStore(CONNECTIONS_FILE)
+    STATE.store = ConnectionStore()
     if not STATE.store.count():
         STATE.store.create_connection("Main Connection")
 
@@ -3081,9 +3058,6 @@ def main() -> None:
     try:
         webview.start(startup, window)
     finally:
-        if STATE.store is not None:
-            with suppress(OSError):
-                STATE.store.save()
         if tunnel is not None:
             tunnel.stop()
         if server is not None:

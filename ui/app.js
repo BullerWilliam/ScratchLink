@@ -13,6 +13,7 @@ const elements = {
   menuCloseButton: document.getElementById('menu-close-button'),
   menuToggleButton: document.getElementById('menu-toggle-button'),
   menuRenameButton: document.getElementById('menu-rename-button'),
+  menuTokenButton: document.getElementById('menu-token-button'),
   menuViewScreenButton: document.getElementById('menu-view-screen-button'),
   menuCopyExtensionButton: document.getElementById('menu-copy-extension-button'),
   menuCopyLinkButton: document.getElementById('menu-copy-link-button'),
@@ -135,6 +136,7 @@ function openMenu(connectionId) {
   elements.menuTitle.textContent = connection.name;
   elements.menuId.textContent = connection.id;
   elements.menuToggleButton.textContent = connection.enabled ? 'Turn Off' : 'Turn On';
+  elements.menuTokenButton.textContent = connection.hasHfToken ? 'Edit HF Token' : 'Add HF Token';
   elements.menuOverlay.classList.remove('hidden');
 }
 
@@ -393,7 +395,11 @@ async function createConnection() {
   if (name === null) {
     return;
   }
-  const data = await api('/admin/connections', { method: 'POST', body: { name } });
+  const hfToken = window.prompt('Paste a Hugging Face token for this connection. Leave it blank if you want to add it later:', '');
+  if (hfToken === null) {
+    return;
+  }
+  const data = await api('/admin/connections', { method: 'POST', body: { name, hf_token: hfToken } });
   await refreshState();
   await copyText(data.connection.extensionUrl, 'New connection created and connection link copied.');
 }
@@ -412,6 +418,22 @@ async function renameMenuConnection() {
   await refreshState();
   openMenu(connection.id);
   showToast('Connection renamed.');
+}
+
+async function editMenuToken() {
+  const connection = getMenuConnection();
+  if (!connection) {
+    showToast('Choose a connection first.');
+    return;
+  }
+  const hfToken = window.prompt('Paste the Hugging Face token for this connection. Leave it blank to remove it:', connection.hfToken || '');
+  if (hfToken === null) {
+    return;
+  }
+  await api(`/admin/connections/${connection.id}/hf-token`, { method: 'POST', body: { hf_token: hfToken } });
+  await refreshState();
+  openMenu(connection.id);
+  showToast(hfToken.trim() ? 'HF token updated.' : 'HF token removed.');
 }
 
 async function toggleMenuConnection() {
@@ -474,6 +496,7 @@ elements.menuOverlay.addEventListener('click', (event) => {
 });
 elements.menuToggleButton.addEventListener('click', () => toggleMenuConnection().catch(handleError));
 elements.menuRenameButton.addEventListener('click', () => renameMenuConnection().catch(handleError));
+elements.menuTokenButton.addEventListener('click', () => editMenuToken().catch(handleError));
 elements.menuViewScreenButton.addEventListener('click', openScreenViewer);
 elements.menuCopyExtensionButton.addEventListener('click', () => copyMenuExtensionLink().catch(handleError));
 elements.menuCopyLinkButton.addEventListener('click', () => copyMenuConnectionLink().catch(handleError));
