@@ -301,7 +301,7 @@
           {
             opcode: "askAi",
             blockType: Scratch.BlockType.REPORTER,
-            text: "ai prompt [PROMPT] instructions [INSTRUCTIONS]",
+            text: "ai prompt [PROMPT] instructions [INSTRUCTIONS] key 1 [APIKEY] key 2 [BACKUPKEY]",
             arguments: {
               PROMPT: {
                 type: Scratch.ArgumentType.STRING,
@@ -310,6 +310,14 @@
               INSTRUCTIONS: {
                 type: Scratch.ArgumentType.STRING,
                 defaultValue: "Be clear and friendly."
+              },
+              APIKEY: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "sk-or-v1-..."
+              },
+              BACKUPKEY: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: ""
               }
             }
           },
@@ -1037,7 +1045,9 @@
           method: "POST",
           body: {
             prompt: String(args.PROMPT || ""),
-            instructions: String(args.INSTRUCTIONS || "")
+            instructions: String(args.INSTRUCTIONS || ""),
+            api_key: String(args.APIKEY || ""),
+            backup_api_key: String(args.BACKUPKEY || "")
           }
         });
         this.connected = true;

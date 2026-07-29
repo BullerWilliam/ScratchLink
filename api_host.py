@@ -44,10 +44,10 @@ CLOUDFLARED_FALLBACK_PATH = os.path.join(TOOLS_DIR, "cloudflared.exe")
 CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_AI_MODEL = os.environ.get("SCRATCHLINK_AI_MODEL", "openai/gpt-oss-120b:fastest")
-DEFAULT_AI_ENDPOINT = os.environ.get("SCRATCHLINK_AI_ENDPOINT", "https://router.huggingface.co/v1/chat/completions")
-DEFAULT_AI_TOKEN_ENV = "SCRATCHLINK_AI_TOKEN"
-DEFAULT_HF_TOKEN_ENV = "HF_TOKEN"
+DEFAULT_AI_MODEL = os.environ.get("SCRATCHLINK_AI_MODEL", "openrouter/free")
+DEFAULT_AI_ENDPOINT = os.environ.get("SCRATCHLINK_AI_ENDPOINT", "https://openrouter.ai/api/v1/chat/completions")
+DEFAULT_AI_TOKEN_ENV = "SCRATCHLINK_OPENROUTER_KEY"
+DEFAULT_AI_BACKUP_TOKEN_ENV = "SCRATCHLINK_OPENROUTER_BACKUP_KEY"
 
 
 def now_iso() -> str:
@@ -772,27 +772,74 @@ class HostedAiManager:
         self.endpoint = endpoint
         self._lock = threading.RLock()
 
-    def _get_token(self, connection: ConnectionRecord) -> str:
-        token = str(connection.hf_token or "").strip()
-        if token:
-            return token
+    def _resolve_tokens(self, connection: ConnectionRecord, primary_key: str = "", backup_key: str = "") -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
 
-        token = os.environ.get(DEFAULT_AI_TOKEN_ENV, "").strip()
-        if token:
-            return token
+        for candidate in (
+            str(primary_key or "").strip(),
+            str(backup_key or "").strip(),
+            str(connection.hf_token or "").strip(),
+            os.environ.get(DEFAULT_AI_TOKEN_ENV, "").strip(),
+            os.environ.get(DEFAULT_AI_BACKUP_TOKEN_ENV, "").strip(),
+        ):
+            if candidate and candidate not in seen:
+                ordered.append(candidate)
+                seen.add(candidate)
 
-        fallback_token = os.environ.get(DEFAULT_HF_TOKEN_ENV, "").strip()
-        if fallback_token:
-            return fallback_token
+        if ordered:
+            return ordered
 
         raise HTTPException(
             status_code=503,
             detail=(
                 "ScratchLink AI is not configured yet. "
-                "Add a Hugging Face token to this connection or set "
-                f"{DEFAULT_AI_TOKEN_ENV} or {DEFAULT_HF_TOKEN_ENV} and restart the app."
+                "Pass an OpenRouter API key into the AI block or set "
+                f"{DEFAULT_AI_TOKEN_ENV} and optionally {DEFAULT_AI_BACKUP_TOKEN_ENV} before starting the app."
             ),
         )
+
+    def _extract_error_detail(self, body: str) -> str:
+        detail = "ScratchLink AI request failed."
+        with suppress(json.JSONDecodeError):
+            error_payload = json.loads(body)
+            if isinstance(error_payload, dict):
+                error_block = error_payload.get("error")
+                if isinstance(error_block, dict) and error_block.get("message"):
+                    detail = str(error_block["message"])
+                elif error_payload.get("message"):
+                    detail = str(error_payload["message"])
+        return detail
+
+    def _should_try_backup_key(self, status_code: int, body: str) -> bool:
+        if status_code in {402, 429}:
+            return True
+
+        with suppress(json.JSONDecodeError):
+            error_payload = json.loads(body)
+            if isinstance(error_payload, dict):
+                error_block = error_payload.get("error")
+                if isinstance(error_block, dict):
+                    metadata = error_block.get("metadata")
+                    if isinstance(metadata, dict):
+                        error_type = str(metadata.get("error_type", "")).strip().lower()
+                        if error_type in {"payment_required", "rate_limit_exceeded", "token_limit_exceeded"}:
+                            return True
+        return False
+
+    def _perform_request(self, token: str, request_bytes: bytes) -> str:
+        request_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        request = urllib.request.Request(
+            self.endpoint,
+            data=request_bytes,
+            headers=request_headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read().decode("utf-8", errors="replace")
 
     def _extract_text(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices")
@@ -813,7 +860,15 @@ class HostedAiManager:
 
         return ""
 
-    def generate(self, connection: ConnectionRecord, prompt: str, instructions: str = "", json_format: str = "") -> dict[str, Any]:
+    def generate(
+        self,
+        connection: ConnectionRecord,
+        prompt: str,
+        instructions: str = "",
+        json_format: str = "",
+        api_key: str = "",
+        backup_api_key: str = "",
+    ) -> dict[str, Any]:
         cleaned_prompt = str(prompt or "").strip()
         if not cleaned_prompt:
             raise HTTPException(status_code=400, detail="An AI prompt is required")
@@ -844,38 +899,34 @@ class HostedAiManager:
         }
 
         request_bytes = json.dumps(request_payload).encode("utf-8")
-        request_headers = {
-            "Authorization": f"Bearer {self._get_token(connection)}",
-            "Content-Type": "application/json",
-        }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=request_bytes,
-            headers=request_headers,
-            method="POST",
-        )
+        tokens = self._resolve_tokens(connection, api_key, backup_api_key)
 
         with self._lock:
-            try:
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    raw_body = response.read().decode("utf-8", errors="replace")
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                detail = "ScratchLink AI request failed."
-                with suppress(json.JSONDecodeError):
-                    error_payload = json.loads(body)
-                    if isinstance(error_payload, dict):
-                        error_block = error_payload.get("error")
-                        if isinstance(error_block, dict) and error_block.get("message"):
-                            detail = str(error_block["message"])
-                        elif error_payload.get("message"):
-                            detail = str(error_payload["message"])
-                raise HTTPException(status_code=502, detail=f"ScratchLink AI request failed: {detail}") from exc
-            except urllib.error.URLError as exc:
+            last_http_error: urllib.error.HTTPError | None = None
+            last_error_detail = "ScratchLink AI request failed."
+            raw_body = ""
+            for index, token in enumerate(tokens):
+                try:
+                    raw_body = self._perform_request(token, request_bytes)
+                    break
+                except urllib.error.HTTPError as exc:
+                    body = exc.read().decode("utf-8", errors="replace")
+                    last_http_error = exc
+                    last_error_detail = self._extract_error_detail(body)
+                    should_retry = index < len(tokens) - 1 and self._should_try_backup_key(exc.code, body)
+                    if should_retry:
+                        continue
+                    raise HTTPException(status_code=502, detail=f"ScratchLink AI request failed: {last_error_detail}") from exc
+                except urllib.error.URLError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="ScratchLink could not reach OpenRouter right now.",
+                    ) from exc
+            else:
                 raise HTTPException(
                     status_code=502,
-                    detail="ScratchLink could not reach the hosted AI service right now.",
-                ) from exc
+                    detail=f"ScratchLink AI request failed: {last_error_detail}",
+                ) from last_http_error
 
         try:
             payload = json.loads(raw_body)
@@ -1018,6 +1069,8 @@ class OutboundHttpRequest(BaseModel):
 class AiGenerateRequest(BaseModel):
     prompt: str
     instructions: str = ""
+    api_key: str = ""
+    backup_api_key: str = ""
     json_format: str = ""
 
 
@@ -1783,7 +1836,14 @@ def outbound_http_post(payload: OutboundHttpRequest, connection: ConnectionRecor
 
 @app.post("/ai/generate")
 def ai_generate(payload: AiGenerateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
-    return STATE.ai_manager.generate(connection, payload.prompt, payload.instructions, payload.json_format)
+    return STATE.ai_manager.generate(
+        connection,
+        payload.prompt,
+        payload.instructions,
+        payload.json_format,
+        payload.api_key,
+        payload.backup_api_key,
+    )
 
 
 @app.get("/screen/buttons")
