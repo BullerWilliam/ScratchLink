@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScratchLink</title>
+  <link rel="stylesheet" href="/app/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">ScratchLink Dashboard</p>
+        <h1>Connection Control Center</h1>
+        <p class="hero-copy">Manage named connections, copy public extension links, and keep every project isolated with its own password.</p>
+      </div>
+      <div class="hero-status" id="hero-status">Cloudflare Tunnel is live</div>
+    </header>
+
+    <div class="toolbar">
+      <button class="primary-button" id="new-connection-button">New Connection</button>
+    </div>
+
+    <section class="connection-grid" id="connection-grid"></section>
+  </div>
+
+  <div class="menu-overlay hidden" id="menu-overlay">
+    <div class="menu-card" id="menu-card">
+      <div class="menu-head">
+        <div>
+          <p class="menu-kicker">Connection</p>
+          <h2 id="menu-title">Connection</h2>
+        </div>
+        <button class="close-button" id="menu-close-button" type="button" aria-label="Close">&times;</button>
+      </div>
+      <p class="menu-id" id="menu-id"></p>
+      <div class="menu-actions">
+        <button class="ghost-button" id="menu-toggle-button">Turn On or Off</button>
+        <button class="ghost-button" id="menu-rename-button">Rename</button>
+        <button class="ghost-button" id="menu-copy-extension-button">Copy Extension Link</button>
+        <button class="ghost-button" id="menu-copy-link-button">Copy Connection Link</button>
+        <button class="danger-button" id="menu-delete-button">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    window.__SCRATCHLINK_BOOTSTRAP__ = __SCRATCHLINK_BOOTSTRAP__;
+  </script>
+  <script src="/app/assets/app.js"></script>
+</body>
+</html>

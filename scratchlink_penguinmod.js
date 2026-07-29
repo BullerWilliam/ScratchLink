@@ -3,10 +3,11 @@
 
   const Cast = Scratch.Cast;
 
-  class FlowMacroLink {
+  class ScratchLink {
     constructor() {
-      this.baseUrl = "__FLOWMACRO_BASE_URL__";
-      this.sessionId = "__FLOWMACRO_SESSION_ID__";
+      this.baseUrl = "__SCRATCHLINK_BASE_URL__";
+      this.connectionId = "__SCRATCHLINK_CONNECTION_ID__";
+      this.password = "__SCRATCHLINK_PASSWORD__";
       this.connected = false;
       this.lastError = "";
       this.mode = "classic";
@@ -15,8 +16,8 @@
 
     getInfo() {
       return {
-        id: "flowmacrolink",
-        name: "FlowMacro Link",
+        id: "scratchlink",
+        name: "ScratchLink",
         color1: "#2779bd",
         color2: "#1c5d8b",
         blocks: [
@@ -36,7 +37,7 @@
             arguments: {
               LINK: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "__FLOWMACRO_BASE_URL__"
+                defaultValue: "__SCRATCHLINK_EXTENSION_URL__"
               }
             }
           },
@@ -74,6 +75,77 @@
           },
           {
             blockType: Scratch.BlockType.LABEL,
+            text: "Hosting"
+          },
+          {
+            opcode: "openHostedDirectory",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "open hosted directory [NAME]",
+            arguments: {
+              NAME: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "webhook"
+              }
+            }
+          },
+          {
+            opcode: "closeHostedDirectory",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "close hosted directory [NAME]",
+            arguments: {
+              NAME: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "webhook"
+              }
+            }
+          },
+          {
+            opcode: "getHostedDirectoryLink",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "hosted directory [NAME] link",
+            arguments: {
+              NAME: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "webhook"
+              }
+            }
+          },
+          {
+            opcode: "getHostedDirectoryWaitingRequests",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "waiting requests under directory [NAME]",
+            arguments: {
+              NAME: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "webhook"
+              }
+            }
+          },
+          {
+            opcode: "respondToHostedRequest",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "respond to request [REQUEST_ID] status [STATUS] headers [HEADERS] body [BODY]",
+            arguments: {
+              REQUEST_ID: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "request-id"
+              },
+              STATUS: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 200
+              },
+              HEADERS: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "{\"Content-Type\":\"application/json\"}"
+              },
+              BODY: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "{\"ok\":true}"
+              }
+            }
+          },
+          {
+            blockType: Scratch.BlockType.LABEL,
             text: "Roblox"
           },
           {
@@ -98,7 +170,7 @@
             arguments: {
               PATH: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents"
+                defaultValue: "Documents"
               }
             }
           },
@@ -109,7 +181,7 @@
             arguments: {
               FOLDER: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents"
+                defaultValue: "Documents"
               }
             }
           },
@@ -120,7 +192,7 @@
             arguments: {
               PATH: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents\example.txt"
+                defaultValue: "example.txt"
               }
             }
           },
@@ -135,7 +207,7 @@
               },
               PATH: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents\example.txt"
+                defaultValue: "example.txt"
               }
             }
           },
@@ -146,7 +218,7 @@
             arguments: {
               PATH: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents\New Folder"
+                defaultValue: "New Folder"
               }
             }
           },
@@ -157,7 +229,7 @@
             arguments: {
               PATH: {
                 type: Scratch.ArgumentType.STRING,
-                defaultValue: "C:\Users\Public\Documents\New Folder"
+                defaultValue: "New Folder"
               }
             }
           },
@@ -454,7 +526,8 @@
         method: options.method || "GET",
         headers: {
           "Content-Type": "application/json",
-          "X-FlowMacro-Session": this.sessionId
+          "X-ScratchLink-Connection": this.connectionId,
+          "X-ScratchLink-Password": this.password
         },
         body: options.body ? JSON.stringify(options.body) : undefined
       });
@@ -467,26 +540,45 @@
       return response.json();
     }
 
-    normalizeConnectionLink(link) {
+    parseConnectionLink(link) {
       const trimmed = String(link || "").trim();
       if (!trimmed) {
         throw new Error("Connection link is required");
       }
 
-      const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
-      const extensionMatch = withoutTrailingSlash.match(/^(https?:\/\/.+)\/extension\/[^/]+\.js$/i);
-      if (extensionMatch) {
-        return extensionMatch[1];
+      let url;
+      try {
+        url = new URL(trimmed);
+      } catch (error) {
+        throw new Error("Connection link must be a full ScratchLink extension URL");
       }
-      return withoutTrailingSlash;
+
+      const match = url.pathname.match(/^(.*)\/extension\/([^/]+)\.js$/i);
+      if (!match) {
+        throw new Error("Use the full extension link copied from the ScratchLink app");
+      }
+
+      const password = url.searchParams.get("password");
+      if (!password) {
+        throw new Error("That connection link is missing its password");
+      }
+
+      const prefix = match[1] || "";
+      return {
+        baseUrl: `${url.origin}${prefix}`,
+        connectionId: match[2],
+        password
+      };
     }
 
     async loadConnectionInfo(link) {
-      const baseUrl = this.normalizeConnectionLink(link);
-      const response = await fetch(baseUrl, {
+      const connection = this.parseConnectionLink(link);
+      const response = await fetch(`${connection.baseUrl}/health`, {
         method: "GET",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          "X-ScratchLink-Connection": connection.connectionId,
+          "X-ScratchLink-Password": connection.password
         }
       });
 
@@ -495,15 +587,7 @@
         throw new Error(text || `HTTP ${response.status}`);
       }
 
-      const data = await response.json();
-      if (!data.sessionId) {
-        throw new Error("Host did not return a sessionId");
-      }
-
-      return {
-        baseUrl,
-        sessionId: String(data.sessionId)
-      };
+      return connection;
     }
 
     async connect() {
@@ -519,17 +603,20 @@
 
     async changeConnectionLink(args) {
       const previousBaseUrl = this.baseUrl;
-      const previousSessionId = this.sessionId;
+      const previousConnectionId = this.connectionId;
+      const previousPassword = this.password;
       this.lastError = "";
       try {
         const connection = await this.loadConnectionInfo(args.LINK);
         this.baseUrl = connection.baseUrl;
-        this.sessionId = connection.sessionId;
+        this.connectionId = connection.connectionId;
+        this.password = connection.password;
         await this.request("/health");
         this.connected = true;
       } catch (error) {
         this.baseUrl = previousBaseUrl;
-        this.sessionId = previousSessionId;
+        this.connectionId = previousConnectionId;
+        this.password = previousPassword;
         this.connected = false;
         this.lastError = String(error);
       }
@@ -576,6 +663,40 @@
       await this.runAction("/roblox/open-game", {
         id: String(args.ID || "").trim()
       }, "roblox.openGame");
+    }
+
+    async openHostedDirectory(args) {
+      await this.safeCommand("/hosted-directories/open", {
+        name: String(args.NAME || "").trim()
+      });
+    }
+
+    async closeHostedDirectory(args) {
+      await this.safeCommand("/hosted-directories/close", {
+        name: String(args.NAME || "").trim()
+      });
+    }
+
+    getHostedDirectoryLink(args) {
+      const name = String(args.NAME || "").trim();
+      if (!name) {
+        return "";
+      }
+      return `${this.baseUrl}/directory/${encodeURIComponent(name)}`;
+    }
+
+    async getHostedDirectoryWaitingRequests(args) {
+      const name = encodeURIComponent(String(args.NAME || "").trim());
+      return this.readAsJsonString(`/hosted-directories/waiting?name=${name}`);
+    }
+
+    async respondToHostedRequest(args) {
+      await this.safeCommand("/hosted-directories/respond", {
+        request_id: String(args.REQUEST_ID || "").trim(),
+        status: Math.max(100, Math.floor(Cast.toNumber(args.STATUS) || 200)),
+        headers: String(args.HEADERS || "{}"),
+        body: String(args.BODY || "")
+      });
     }
 
     async openFile(args) {
@@ -779,5 +900,5 @@
     }
   }
 
-  Scratch.extensions.register(new FlowMacroLink());
+  Scratch.extensions.register(new ScratchLink());
 })(Scratch);

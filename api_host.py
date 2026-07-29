@@ -1,42 +1,416 @@
+import asyncio
 import argparse
 import base64
 import json
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import threading
 import time
+import tkinter as tk
+import urllib.request
 import uuid
 from contextlib import suppress
-from typing import Any
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from tkinter import messagebox, simpledialog, ttk
+from typing import Any, Callable
+from urllib.parse import quote
 
 import mss
 import mss.tools
 import pyautogui
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
+import webview
 
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXTENSION_FILE = os.path.join(HERE, "flowmacro_penguinmod.js")
-SESSION_ID = uuid.uuid4().hex
-EXTENSION_TEMPLATE = ""
+EXTENSION_FILE = os.path.join(HERE, "scratchlink_penguinmod.js")
+CONNECTIONS_FILE = os.path.join(HERE, "scratchlink_connections.json")
+TOOLS_DIR = os.path.join(HERE, "tools")
+UI_DIR = os.path.join(HERE, "ui")
+CLOUDFLARED_FALLBACK_PATH = os.path.join(TOOLS_DIR, "cloudflared.exe")
+CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
 
-MOUSE_BUTTONS = {"left", "middle", "right"}
-KEY_ALIASES = {
-    "windows": "win",
-    "meta": "win",
-    "super": "win",
-    "command": "command",
-    "cmd": "command",
-}
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_timestamp(value: str | None) -> str:
+    if not value:
+        return "Never"
+    with suppress(ValueError):
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return value
+
+
+def shorten_connection_id(value: str) -> str:
+    if len(value) <= 18:
+        return value
+    return f"{value[:8]}...{value[-6:]}"
+
+
+@dataclass
+class ConnectionRecord:
+    id: str
+    name: str
+    password: str
+    enabled: bool
+    created_at: str
+    last_used_at: str | None = None
+
+
+class ConnectionStore:
+    def __init__(self, storage_path: str):
+        self.storage_path = storage_path
+        self._lock = threading.RLock()
+        self._connections: dict[str, ConnectionRecord] = {}
+        self.load()
+
+    def load(self) -> None:
+        with self._lock:
+            if not os.path.exists(self.storage_path):
+                self._connections = {}
+                return
+
+            try:
+                with open(self.storage_path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                self._connections = {}
+                return
+
+            if not isinstance(raw, list):
+                self._connections = {}
+                return
+
+            loaded: dict[str, ConnectionRecord] = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                connection_id = str(item.get("id", "")).strip()
+                name = str(item.get("name", "")).strip()
+                password = str(item.get("password", "")).strip()
+                created_at = str(item.get("created_at", "")).strip() or now_iso()
+                if not connection_id or not name or not password:
+                    continue
+                loaded[connection_id] = ConnectionRecord(
+                    id=connection_id,
+                    name=name,
+                    password=password,
+                    enabled=bool(item.get("enabled", True)),
+                    created_at=created_at,
+                    last_used_at=str(item.get("last_used_at") or "").strip() or None,
+                )
+            self._connections = loaded
+
+    def save(self) -> None:
+        with self._lock:
+            payload = [asdict(connection) for connection in self._sorted_connections_locked()]
+            with open(self.storage_path, "w", encoding="utf-8", newline="") as handle:
+                json.dump(payload, handle, indent=2)
+
+    def _sorted_connections_locked(self) -> list[ConnectionRecord]:
+        return sorted(self._connections.values(), key=lambda item: (item.created_at, item.name.casefold()))
+
+    def list_connections(self) -> list[ConnectionRecord]:
+        with self._lock:
+            return [ConnectionRecord(**asdict(item)) for item in self._sorted_connections_locked()]
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._connections)
+
+    def _default_name_locked(self) -> str:
+        existing_names = {item.name.casefold() for item in self._connections.values()}
+        index = 1
+        while True:
+            candidate = f"Connection {index}"
+            if candidate.casefold() not in existing_names:
+                return candidate
+            index += 1
+
+    def create_connection(self, name: str | None = None) -> ConnectionRecord:
+        with self._lock:
+            connection = ConnectionRecord(
+                id=uuid.uuid4().hex,
+                name=(name or "").strip() or self._default_name_locked(),
+                password=secrets.token_urlsafe(18),
+                enabled=True,
+                created_at=now_iso(),
+            )
+            self._connections[connection.id] = connection
+            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+    def get(self, connection_id: str) -> ConnectionRecord | None:
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                return None
+            return ConnectionRecord(**asdict(connection))
+
+    def require(self, connection_id: str) -> ConnectionRecord:
+        connection = self.get(connection_id)
+        if connection is None:
+            raise HTTPException(status_code=404, detail="Unknown ScratchLink connection")
+        return connection
+
+    def rename_connection(self, connection_id: str, new_name: str) -> ConnectionRecord:
+        cleaned = new_name.strip()
+        if not cleaned:
+            raise ValueError("Connection name cannot be empty")
+
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                raise KeyError(connection_id)
+            connection.name = cleaned
+            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+    def toggle_connection(self, connection_id: str) -> ConnectionRecord:
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                raise KeyError(connection_id)
+            connection.enabled = not connection.enabled
+            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+    def regenerate_password(self, connection_id: str) -> ConnectionRecord:
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                raise KeyError(connection_id)
+            connection.password = secrets.token_urlsafe(18)
+            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+    def delete_connection(self, connection_id: str) -> None:
+        with self._lock:
+            if connection_id not in self._connections:
+                raise KeyError(connection_id)
+            del self._connections[connection_id]
+            self.save()
+
+    def authenticate(self, connection_id: str | None, password: str | None) -> ConnectionRecord:
+        if not connection_id or not password:
+            raise HTTPException(status_code=403, detail="ScratchLink credentials are required")
+
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                raise HTTPException(status_code=403, detail="Unknown ScratchLink connection")
+            if not connection.enabled:
+                raise HTTPException(status_code=403, detail="This ScratchLink connection is turned off")
+            if not secrets.compare_digest(connection.password, password):
+                raise HTTPException(status_code=403, detail="ScratchLink password was rejected")
+            connection.last_used_at = now_iso()
+            self.save()
+            return ConnectionRecord(**asdict(connection))
+
+
+@dataclass
+class HostedRequestRecord:
+    request_id: str
+    connection_id: str
+    directory_name: str
+    method: str
+    path: str
+    query: str
+    headers: dict[str, str]
+    body_text: str
+    received_at: str
+    event: threading.Event
+    response_ready: bool = False
+    status_code: int = 200
+    response_headers: dict[str, str] | None = None
+    response_body: str = ""
+
+
+@dataclass
+class HostedDirectoryRecord:
+    name: str
+    connection_id: str
+    created_at: str
+    open: bool = True
+    requests: dict[str, HostedRequestRecord] | None = None
+    request_order: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.requests is None:
+            self.requests = {}
+        if self.request_order is None:
+            self.request_order = []
+
+
+class DirectoryHost:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._directories: dict[str, HostedDirectoryRecord] = {}
+        self._request_index: dict[str, HostedRequestRecord] = {}
+
+    def _normalize_name(self, value: str) -> str:
+        cleaned = "".join(character for character in str(value or "").strip().lower() if character.isalnum() or character in ("-", "_"))
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="Directory name must contain letters or numbers")
+        return cleaned
+
+    def open_directory(self, connection_id: str, name: str) -> HostedDirectoryRecord:
+        directory_name = self._normalize_name(name)
+        with self._lock:
+            existing = self._directories.get(directory_name)
+            if existing is not None and existing.connection_id != connection_id:
+                raise HTTPException(status_code=409, detail="That hosted directory name is already in use")
+            if existing is None:
+                existing = HostedDirectoryRecord(name=directory_name, connection_id=connection_id, created_at=now_iso(), open=True)
+                self._directories[directory_name] = existing
+            else:
+                existing.open = True
+            return existing
+
+    def close_directory(self, connection_id: str, name: str) -> HostedDirectoryRecord:
+        directory_name = self._normalize_name(name)
+        with self._lock:
+            directory = self._directories.get(directory_name)
+            if directory is None or directory.connection_id != connection_id:
+                raise HTTPException(status_code=404, detail="That hosted directory was not found")
+            directory.open = False
+            return directory
+
+    def get_directory(self, connection_id: str, name: str) -> HostedDirectoryRecord:
+        directory_name = self._normalize_name(name)
+        with self._lock:
+            directory = self._directories.get(directory_name)
+            if directory is None or directory.connection_id != connection_id:
+                raise HTTPException(status_code=404, detail="That hosted directory was not found")
+            return directory
+
+    def queue_request(self, directory_name: str, method: str, path: str, query: str, headers: dict[str, str], body_text: str) -> HostedRequestRecord:
+        normalized_name = self._normalize_name(directory_name)
+        with self._lock:
+            directory = self._directories.get(normalized_name)
+            if directory is None or not directory.open:
+                raise HTTPException(status_code=404, detail="That hosted directory is not open")
+
+            request_id = uuid.uuid4().hex
+            record = HostedRequestRecord(
+                request_id=request_id,
+                connection_id=directory.connection_id,
+                directory_name=normalized_name,
+                method=method.upper(),
+                path=path,
+                query=query,
+                headers=headers,
+                body_text=body_text,
+                received_at=now_iso(),
+                event=threading.Event(),
+            )
+            directory.requests[request_id] = record
+            directory.request_order.append(request_id)
+            self._request_index[request_id] = record
+            return record
+
+    def list_waiting_requests(self, connection_id: str, name: str) -> list[HostedRequestRecord]:
+        directory = self.get_directory(connection_id, name)
+        with self._lock:
+            return [
+                directory.requests[request_id]
+                for request_id in directory.request_order
+                if request_id in directory.requests and not directory.requests[request_id].response_ready
+            ]
+
+    def respond_to_request(
+        self,
+        connection_id: str,
+        request_id: str,
+        status_code: int,
+        headers: dict[str, str],
+        body_text: str,
+    ) -> HostedRequestRecord:
+        with self._lock:
+            record = self._request_index.get(request_id)
+            if record is None or record.connection_id != connection_id:
+                raise HTTPException(status_code=404, detail="That hosted request was not found")
+            if record.response_ready:
+                raise HTTPException(status_code=409, detail="That hosted request already has a response")
+            record.status_code = max(100, min(int(status_code), 599))
+            record.response_headers = headers
+            record.response_body = body_text
+            record.response_ready = True
+            record.event.set()
+            return record
+
+    def finish_request(self, request_id: str) -> None:
+        with self._lock:
+            record = self._request_index.pop(request_id, None)
+            if record is None:
+                return
+            directory = self._directories.get(record.directory_name)
+            if directory is None:
+                return
+            directory.requests.pop(request_id, None)
+            with suppress(ValueError):
+                directory.request_order.remove(request_id)
+
+
+def serialize_hosted_request(record: HostedRequestRecord) -> dict[str, Any]:
+    return {
+        "requestId": record.request_id,
+        "directory": record.directory_name,
+        "method": record.method,
+        "path": record.path,
+        "query": record.query,
+        "headers": record.headers,
+        "body": record.body_text,
+        "receivedAt": record.received_at,
+    }
+
+
+def parse_headers_json(value: str) -> dict[str, str]:
+    text = str(value or "").strip() or "{}"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Headers must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Headers must be a JSON object")
+    return {str(key): str(item) for key, item in parsed.items()}
+
+
+class RuntimeState:
+    def __init__(self):
+        self.store: ConnectionStore | None = None
+        self.extension_template = ""
+        self.local_base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
+        self.public_base_url = ""
+        self.admin_token = secrets.token_urlsafe(24)
+        self.directory_host = DirectoryHost()
+
+    def require_store(self) -> ConnectionStore:
+        if self.store is None:
+            raise HTTPException(status_code=503, detail="ScratchLink is not ready yet")
+        return self.store
+
+    def api_base_url(self) -> str:
+        return self.public_base_url or self.local_base_url
+
+
+STATE = RuntimeState()
 
 
 class MouseMoveRequest(BaseModel):
@@ -108,7 +482,26 @@ class BatchRequest(BaseModel):
     actions: list[ActionItem] = Field(default_factory=list)
 
 
-app = FastAPI(title="FlowMacro Scratch Link")
+class ConnectionCreateRequest(BaseModel):
+    name: str | None = None
+
+
+class ConnectionRenameRequest(BaseModel):
+    name: str
+
+
+class HostedDirectoryRequest(BaseModel):
+    name: str
+
+
+class HostedRequestResponsePayload(BaseModel):
+    request_id: str
+    status: int = 200
+    headers: str = "{}"
+    body: str = ""
+
+
+app = FastAPI(title="ScratchLink")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -117,23 +510,76 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MOUSE_BUTTONS = {"left", "middle", "right"}
+KEY_ALIASES = {
+    "windows": "win",
+    "meta": "win",
+    "super": "win",
+    "command": "command",
+    "cmd": "command",
+}
+
 
 def load_extension_template() -> str:
     with open(EXTENSION_FILE, "r", encoding="utf-8") as handle:
         return handle.read()
 
 
-def build_extension_script(base_url: str) -> str:
+def build_extension_script(connection: ConnectionRecord) -> str:
+    base_url = STATE.api_base_url().rstrip("/")
+    extension_url = make_extension_url(connection, base_url)
     return (
-        EXTENSION_TEMPLATE
-        .replace("__FLOWMACRO_SESSION_ID__", SESSION_ID)
-        .replace("__FLOWMACRO_BASE_URL__", base_url.rstrip("/"))
+        STATE.extension_template
+        .replace("__SCRATCHLINK_BASE_URL__", base_url)
+        .replace("__SCRATCHLINK_CONNECTION_ID__", connection.id)
+        .replace("__SCRATCHLINK_PASSWORD__", connection.password)
+        .replace("__SCRATCHLINK_EXTENSION_URL__", extension_url)
     )
 
 
-def require_session(x_flowmacro_session: str | None = Header(default=None)) -> None:
-    if x_flowmacro_session != SESSION_ID:
-        raise HTTPException(status_code=403, detail="Invalid FlowMacro session")
+def make_extension_url(connection: ConnectionRecord, base_url: str | None = None) -> str:
+    base = (base_url or STATE.api_base_url()).rstrip("/")
+    return f"{base}/extension/{connection.id}.js?password={quote(connection.password)}"
+
+
+def get_store() -> ConnectionStore:
+    return STATE.require_store()
+
+
+def require_connection(
+    x_scratchlink_connection: str | None = Header(default=None),
+    x_scratchlink_password: str | None = Header(default=None),
+) -> ConnectionRecord:
+    return get_store().authenticate(x_scratchlink_connection, x_scratchlink_password)
+
+
+def require_admin(
+    request: Request,
+    x_scratchlink_admin: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> None:
+    client_host = ""
+    if request.client and request.client.host:
+        client_host = request.client.host.strip().lower()
+
+    if client_host in {"127.0.0.1", "localhost", "::1"}:
+        return
+
+    supplied = x_scratchlink_admin or token
+    if not supplied or not secrets.compare_digest(supplied, STATE.admin_token):
+        raise HTTPException(status_code=403, detail="ScratchLink admin token was rejected")
+
+
+def serialize_connection(connection: ConnectionRecord) -> dict[str, Any]:
+    return {
+        "id": connection.id,
+        "name": connection.name,
+        "password": connection.password,
+        "enabled": connection.enabled,
+        "createdAt": connection.created_at,
+        "lastUsedAt": connection.last_used_at,
+        "extensionUrl": make_extension_url(connection),
+    }
 
 
 def normalize_button(button: str) -> str:
@@ -300,15 +746,14 @@ def get_windows_start_apps() -> list[dict[str, str]]:
 def find_windows_app(app_name: str) -> tuple[str, str] | None:
     best: tuple[tuple[int, int, str], str, str] | None = None
 
-    for app in get_windows_start_apps():
-        score = app_match_score(app_name, app["name"])
+    for app_item in get_windows_start_apps():
+        score = app_match_score(app_name, app_item["name"])
         if score is not None and (best is None or score < best[0]):
-            best = (score, app["name"], app["id"])
+            best = (score, app_item["name"], app_item["id"])
 
     if best is not None:
         return best[1], best[2]
 
-    target_name = normalize_app_name(app_name)
     executable_names = [app_name, f"{app_name}.exe"]
 
     for executable_name in executable_names:
@@ -318,14 +763,12 @@ def find_windows_app(app_name: str) -> tuple[str, str] | None:
 
     windows_apps = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps")
     if windows_apps and os.path.isdir(windows_apps):
-        try:
+        with suppress(OSError):
             for filename in os.listdir(windows_apps):
                 if filename.lower().endswith(".exe"):
                     score = app_match_score(app_name, os.path.splitext(filename)[0])
                     if score is not None and (best is None or score < best[0]):
                         best = (score, filename, os.path.join(windows_apps, filename))
-        except OSError:
-            pass
 
     start_menu_paths = [
         os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
@@ -358,10 +801,10 @@ def open_app_by_name(app_name: str) -> dict[str, Any]:
 
     try:
         if platform.system() == "Windows":
-            app = find_windows_app(app_name)
-            if not app:
+            app_item = find_windows_app(app_name)
+            if not app_item:
                 raise HTTPException(status_code=404, detail=f"Could not find an app named: {app_name}")
-            match_name, launch_target = app
+            match_name, launch_target = app_item
             if launch_target.startswith("shell:AppsFolder"):
                 subprocess.Popen(
                     ["explorer.exe", launch_target],
@@ -462,158 +905,325 @@ def execute_action(action_type: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/")
 def root() -> dict[str, Any]:
+    store = get_store()
     return {
-        "name": "FlowMacro Scratch Link",
+        "name": "ScratchLink",
         "status": "ok",
-        "sessionId": SESSION_ID,
-        "extensionUrl": f"/extension/{SESSION_ID}.js",
+        "mode": "cloudflare-app",
+        "connectionCount": store.count(),
+        "apiBaseUrl": STATE.api_base_url(),
         "docs": "/docs",
     }
 
 
+@app.get("/app", response_class=HTMLResponse)
+def app_shell(token: str = Query(default="")) -> HTMLResponse:
+    if not token or not secrets.compare_digest(token, STATE.admin_token):
+        raise HTTPException(status_code=403, detail="ScratchLink app token was rejected")
+
+    index_path = os.path.join(UI_DIR, "index.html")
+    try:
+        with open(index_path, "r", encoding="utf-8") as handle:
+            html = handle.read()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load the ScratchLink app shell: {exc}") from exc
+
+    bootstrap = json.dumps(
+        {
+            "adminToken": STATE.admin_token,
+            "publicApiUrl": STATE.api_base_url(),
+            "docsUrl": f"{STATE.api_base_url()}/docs",
+        }
+    )
+    html = html.replace("__SCRATCHLINK_BOOTSTRAP__", bootstrap)
+    return HTMLResponse(html)
+
+
+@app.get("/app/assets/{asset_name}")
+def app_asset(asset_name: str) -> FileResponse:
+    allowed = {"app.css", "app.js"}
+    if asset_name not in allowed:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink asset")
+    asset_path = os.path.join(UI_DIR, asset_name)
+    if not os.path.isfile(asset_path):
+        raise HTTPException(status_code=404, detail="ScratchLink asset file is missing")
+    media_type = "text/css" if asset_name.endswith(".css") else "application/javascript"
+    return FileResponse(asset_path, media_type=media_type)
+
+
+@app.get("/admin/state")
+def admin_state(_: None = Depends(require_admin)) -> dict[str, Any]:
+    connections = get_store().list_connections()
+    return {
+        "publicApiUrl": STATE.api_base_url(),
+        "docsUrl": f"{STATE.api_base_url()}/docs",
+        "connectionCount": len(connections),
+        "enabledCount": sum(1 for item in connections if item.enabled),
+        "connections": [serialize_connection(item) for item in connections],
+    }
+
+
+@app.post("/admin/connections")
+def admin_create_connection(payload: ConnectionCreateRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+    connection = get_store().create_connection(payload.name)
+    return {"connection": serialize_connection(connection)}
+
+
+@app.post("/admin/connections/{connection_id}/rename")
+def admin_rename_connection(connection_id: str, payload: ConnectionRenameRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        connection = get_store().rename_connection(connection_id, payload.name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"connection": serialize_connection(connection)}
+
+
+@app.post("/admin/connections/{connection_id}/toggle")
+def admin_toggle_connection(connection_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        connection = get_store().toggle_connection(connection_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
+    return {"connection": serialize_connection(connection)}
+
+
+@app.post("/admin/connections/{connection_id}/regenerate-password")
+def admin_regenerate_connection_password(connection_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        connection = get_store().regenerate_password(connection_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
+    return {"connection": serialize_connection(connection)}
+
+
+@app.delete("/admin/connections/{connection_id}")
+def admin_delete_connection(connection_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        get_store().delete_connection(connection_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown ScratchLink connection") from exc
+
+    if not get_store().count():
+        get_store().create_connection("Main Connection")
+
+    return {"ok": True}
+
+
+@app.post("/hosted-directories/open")
+def open_hosted_directory(payload: HostedDirectoryRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    directory = STATE.directory_host.open_directory(connection.id, payload.name)
+    return {
+        "ok": True,
+        "directory": directory.name,
+        "url": f"{STATE.api_base_url().rstrip('/')}/directory/{directory.name}",
+    }
+
+
+@app.post("/hosted-directories/close")
+def close_hosted_directory(payload: HostedDirectoryRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    directory = STATE.directory_host.close_directory(connection.id, payload.name)
+    return {"ok": True, "directory": directory.name}
+
+
+@app.get("/hosted-directories/waiting")
+def get_hosted_directory_waiting_requests(name: str, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    waiting = STATE.directory_host.list_waiting_requests(connection.id, name)
+    return {
+        "directory": STATE.directory_host.get_directory(connection.id, name).name,
+        "count": len(waiting),
+        "requests": [serialize_hosted_request(item) for item in waiting],
+    }
+
+
+@app.post("/hosted-directories/respond")
+def respond_to_hosted_request(payload: HostedRequestResponsePayload, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    record = STATE.directory_host.respond_to_request(
+        connection.id,
+        payload.request_id,
+        payload.status,
+        parse_headers_json(payload.headers),
+        str(payload.body or ""),
+    )
+    return {"ok": True, "requestId": record.request_id}
+
+
+@app.api_route("/directory/{directory_name}", methods=["GET", "POST"])
+@app.api_route("/directory/{directory_name}/{request_path:path}", methods=["GET", "POST"])
+async def public_directory_request(directory_name: str, request: Request, request_path: str = "") -> Response:
+    body_bytes = await request.body()
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    filtered_headers = {
+        str(key): str(value)
+        for key, value in request.headers.items()
+        if key.lower() not in {"host", "content-length", "x-forwarded-for", "cf-ray", "cf-connecting-ip"}
+    }
+    path_suffix = f"/{request_path}" if request_path else ""
+    record = STATE.directory_host.queue_request(
+        directory_name=directory_name,
+        method=request.method,
+        path=path_suffix or "/",
+        query=request.url.query,
+        headers=filtered_headers,
+        body_text=body_text,
+    )
+
+    responded = await asyncio.to_thread(record.event.wait, 300)
+    if not responded:
+        STATE.directory_host.finish_request(record.request_id)
+        return Response(content="ScratchLink request timed out", status_code=504, media_type="text/plain")
+
+    headers = record.response_headers or {}
+    content_type = headers.get("Content-Type") or headers.get("content-type")
+    response = Response(content=record.response_body, status_code=record.status_code, media_type=content_type)
+    for key, value in headers.items():
+        if key.lower() == "content-type":
+            continue
+        response.headers[key] = value
+    STATE.directory_host.finish_request(record.request_id)
+    return response
+
+
 @app.get("/health")
-def health(x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def health(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
     width, height = pyautogui.size()
     x, y = pyautogui.position()
     return {
         "ok": True,
+        "connection": {"id": connection.id, "name": connection.name},
         "screen": {"width": width, "height": height},
         "mouse": {"x": x, "y": y},
     }
 
 
-@app.get("/extension/{session_id}.js")
-def extension_js(session_id: str, request: Request) -> PlainTextResponse:
-    if session_id != SESSION_ID:
-        raise HTTPException(status_code=404, detail="Unknown extension session")
-    base_url = str(request.base_url).rstrip("/")
-    script = build_extension_script(base_url)
-    return PlainTextResponse(script, media_type="application/javascript")
+@app.get("/extension/{connection_id}.js")
+def extension_js(connection_id: str, password: str = Query(default="")) -> PlainTextResponse:
+    connection = get_store().require(connection_id)
+    if not password or not secrets.compare_digest(connection.password, password):
+        raise HTTPException(status_code=403, detail="The extension password is invalid")
+    return PlainTextResponse(build_extension_script(connection), media_type="application/javascript")
 
 
 @app.get("/screen")
-def get_screen(x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_screen(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return screenshot_as_base64()
 
 
 @app.get("/screen/all")
-def get_all_screens(x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_all_screens(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return screenshot_as_base64()
 
 
 @app.get("/screen/{screen_number}")
-def get_screen_number(screen_number: int, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_screen_number(screen_number: int, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return screenshot_as_base64(screen_number)
 
 
 @app.get("/screen/info")
-def get_screen_info(x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_screen_info(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     width, height = pyautogui.size()
     return {"width": width, "height": height}
 
 
 @app.get("/screen/info/{screen_number}")
-def get_screen_number_info(screen_number: int, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_screen_number_info(screen_number: int, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return get_monitor_info(screen_number)
 
 
 @app.get("/mouse")
-def get_mouse(x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_mouse(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     x, y = pyautogui.position()
     return {"x": x, "y": y}
 
 
 @app.post("/mouse/move")
-def move_mouse(payload: MouseMoveRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def move_mouse(payload: MouseMoveRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     pyautogui.moveTo(payload.x, payload.y, duration=max(payload.duration, 0))
     x, y = pyautogui.position()
     return {"ok": True, "x": x, "y": y}
 
 
 @app.post("/mouse/move-by")
-def move_mouse_by(payload: MouseOffsetRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def move_mouse_by(payload: MouseOffsetRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     pyautogui.move(payload.dx, payload.dy, duration=max(payload.duration, 0))
     x, y = pyautogui.position()
     return {"ok": True, "x": x, "y": y}
 
 
 @app.post("/mouse/down")
-def mouse_down(payload: MouseButtonRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def mouse_down(payload: MouseButtonRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     pyautogui.mouseDown(button=normalize_button(payload.button))
     return {"ok": True}
 
 
 @app.post("/mouse/up")
-def mouse_up(payload: MouseButtonRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def mouse_up(payload: MouseButtonRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     pyautogui.mouseUp(button=normalize_button(payload.button))
     return {"ok": True}
 
 
 @app.post("/mouse/click")
-def mouse_click(payload: MouseClickRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
-    return execute_action(
-        "mouse.click",
-        {"button": payload.button, "clicks": payload.clicks, "interval": payload.interval},
-    )
+def mouse_click(payload: MouseClickRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
+    return execute_action("mouse.click", {"button": payload.button, "clicks": payload.clicks, "interval": payload.interval})
 
 
 @app.post("/keyboard/down")
-def key_down(payload: KeyRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def key_down(payload: KeyRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("keyboard.down", {"key": payload.key})
 
 
 @app.post("/keyboard/up")
-def key_up(payload: KeyRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def key_up(payload: KeyRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("keyboard.up", {"key": payload.key})
 
 
 @app.post("/keyboard/press")
-def key_press(payload: KeyRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def key_press(payload: KeyRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("keyboard.press", {"key": payload.key})
 
 
 @app.post("/keyboard/hotkey")
-def hotkey(payload: HotkeyRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def hotkey(payload: HotkeyRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("keyboard.hotkey", {"keys": payload.keys})
 
 
 @app.post("/keyboard/write")
-def write_text(payload: WriteRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def write_text(payload: WriteRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("keyboard.write", {"text": payload.text, "interval": payload.interval})
 
 
 @app.post("/wait")
-def wait_seconds(payload: WaitRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def wait_seconds(payload: WaitRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return execute_action("wait", {"seconds": payload.seconds})
 
 
 @app.post("/roblox/open-game")
-def roblox_open_game(payload: RobloxGameRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def roblox_open_game(payload: RobloxGameRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return open_roblox_game(payload.id)
 
 
 @app.post("/file/open")
-def open_file(payload: OpenFileRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def open_file(payload: OpenFileRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     path = resolve_path(payload.path, "file path")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"File or folder was not found: {path}")
@@ -630,16 +1240,16 @@ def open_file(payload: OpenFileRequest, x_flowmacro_session: str | None = Header
 
 
 @app.get("/files/list")
-def get_files_under_folder(path: str, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def get_files_under_folder(path: str, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     folder = resolve_path(path, "folder path")
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Folder was not found: {folder}")
 
     files: list[str] = []
-    for root, _, filenames in os.walk(folder, followlinks=False):
+    for root_dir, _, filenames in os.walk(folder, followlinks=False):
         for filename in filenames:
-            files.append(os.path.join(root, filename))
+            files.append(os.path.join(root_dir, filename))
             if len(files) >= 10000:
                 return {"files": sorted(files, key=str.casefold), "truncated": True}
 
@@ -647,8 +1257,8 @@ def get_files_under_folder(path: str, x_flowmacro_session: str | None = Header(d
 
 
 @app.get("/files/read")
-def read_file(path: str, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def read_file(path: str, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     file_path = resolve_path(path, "file path")
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail=f"File was not found: {file_path}")
@@ -663,8 +1273,8 @@ def read_file(path: str, x_flowmacro_session: str | None = Header(default=None))
 
 
 @app.post("/files/write")
-def write_file(payload: FileWriteRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def write_file(payload: FileWriteRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     file_path = resolve_path(payload.path, "file path")
     parent = os.path.dirname(file_path)
 
@@ -679,8 +1289,8 @@ def write_file(payload: FileWriteRequest, x_flowmacro_session: str | None = Head
 
 
 @app.post("/folders/create")
-def create_folder(payload: FolderRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def create_folder(payload: FolderRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     folder = resolve_path(payload.path, "folder path")
 
     try:
@@ -692,8 +1302,8 @@ def create_folder(payload: FolderRequest, x_flowmacro_session: str | None = Head
 
 
 @app.post("/folders/destroy")
-def destroy_folder(payload: FolderRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def destroy_folder(payload: FolderRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     folder = resolve_path(payload.path, "folder path")
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Folder was not found: {folder}")
@@ -709,75 +1319,25 @@ def destroy_folder(payload: FolderRequest, x_flowmacro_session: str | None = Hea
 
 
 @app.post("/app/open")
-def open_app(payload: OpenAppRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def open_app(payload: OpenAppRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     return open_app_by_name(payload.name)
 
 
 @app.post("/batch")
-def run_batch(payload: BatchRequest, x_flowmacro_session: str | None = Header(default=None)) -> dict[str, Any]:
-    require_session(x_flowmacro_session)
+def run_batch(payload: BatchRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
     results = [execute_action(action.type, action.payload) for action in payload.actions]
     return {"ok": True, "count": len(results), "results": results}
-
-
-def open_cloudflare_tunnel(port: int) -> str | None:
-    cloudflared = ensure_cloudflared()
-    if not cloudflared:
-        return None
-
-    command = [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-    url_holder = {"url": None}
-
-    def collect() -> None:
-        if not process.stdout:
-            return
-        for line in process.stdout:
-            text = line.rstrip()
-            if "trycloudflare.com" in text and "https://" in text and not url_holder["url"]:
-                for token in line.split():
-                    if token.startswith("https://") and "trycloudflare.com" in token:
-                        url_holder["url"] = token
-                        print(f"Cloudflare tunnel ready: {token}")
-                        break
-                continue
-
-            lowered = text.lower()
-            if any(word in lowered for word in ("error", "failed", "unable", "panic")):
-                print(f"[cloudflared] {text}")
-
-    thread = threading.Thread(target=collect, daemon=True)
-    thread.start()
-
-    for _ in range(60):
-        if url_holder["url"]:
-            return url_holder["url"]
-        if process.poll() is not None:
-            break
-        time.sleep(0.5)
-
-    with suppress(Exception):
-        process.terminate()
-    return None
-
-
-def start_tunnel(port: int) -> str | None:
-    return open_cloudflare_tunnel(port)
 
 
 def find_cloudflared_executable() -> str | None:
     cloudflared = shutil.which("cloudflared")
     if cloudflared:
         return cloudflared
+
+    if os.path.isfile(CLOUDFLARED_FALLBACK_PATH):
+        return CLOUDFLARED_FALLBACK_PATH
 
     local_appdata = os.environ.get("LOCALAPPDATA", "")
     program_files = os.environ.get("ProgramFiles", "")
@@ -794,25 +1354,24 @@ def find_cloudflared_executable() -> str | None:
     for base in candidates:
         if not base or not os.path.isdir(base):
             continue
-
         direct = os.path.join(base, "cloudflared.exe")
         if os.path.isfile(direct):
             return direct
-
-        for root, _, files in os.walk(base):
+        for root_dir, _, files in os.walk(base):
             if "cloudflared.exe" in files:
-                return os.path.join(root, "cloudflared.exe")
+                return os.path.join(root_dir, "cloudflared.exe")
 
     return None
 
 
-def install_cloudflared_windows() -> str | None:
+def install_cloudflared_with_winget(progress: Callable[[str], None] | None = None) -> str | None:
     winget = shutil.which("winget")
     if not winget:
-        print("cloudflared was not found and winget is unavailable, so auto-install could not run.")
         return None
 
-    print("cloudflared was not found. Attempting automatic install with winget...")
+    if progress:
+        progress("Downloading Cloudflare Tunnel with winget...")
+
     command = [
         winget,
         "install",
@@ -824,66 +1383,908 @@ def install_cloudflared_windows() -> str | None:
     ]
 
     try:
-        result = subprocess.run(command, check=False, text=True)
-    except OSError as exc:
-        print(f"Automatic cloudflared install failed to launch: {exc}")
+        result = subprocess.run(command, check=False, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
         return None
 
-    if result.returncode != 0:
-        existing = find_cloudflared_executable()
-        if existing:
-            print("winget reported a non-success code, but cloudflared was found locally and will be used.")
-            return existing
-        print(f"Automatic cloudflared install failed with exit code {result.returncode}.")
-        return None
-
-    return find_cloudflared_executable()
-
-
-def ensure_cloudflared() -> str | None:
-    cloudflared = find_cloudflared_executable()
-    if cloudflared:
-        return cloudflared
-
-    if platform.system() == "Windows":
-        return install_cloudflared_windows()
-
-    print("cloudflared was not found on PATH.")
+    if result.returncode == 0:
+        return find_cloudflared_executable()
     return None
 
 
+def download_cloudflared_direct(progress: Callable[[str], None] | None = None) -> str | None:
+    if platform.system() != "Windows":
+        return None
+
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    if progress:
+        progress("Downloading Cloudflare Tunnel directly...")
+
+    try:
+        with urllib.request.urlopen(CLOUDFLARED_DOWNLOAD_URL, timeout=120) as response:
+            data = response.read()
+        with open(CLOUDFLARED_FALLBACK_PATH, "wb") as handle:
+            handle.write(data)
+    except OSError:
+        return None
+
+    return CLOUDFLARED_FALLBACK_PATH if os.path.isfile(CLOUDFLARED_FALLBACK_PATH) else None
+
+
+def ensure_cloudflared(progress: Callable[[str], None] | None = None) -> str:
+    existing = find_cloudflared_executable()
+    if existing:
+        if progress:
+            progress("Cloudflare Tunnel is already installed.")
+        return existing
+
+    installed = install_cloudflared_with_winget(progress)
+    if installed:
+        if progress:
+            progress("Cloudflare Tunnel installed successfully.")
+        return installed
+
+    downloaded = download_cloudflared_direct(progress)
+    if downloaded:
+        if progress:
+            progress("Cloudflare Tunnel downloaded successfully.")
+        return downloaded
+
+    raise RuntimeError("ScratchLink could not install Cloudflare Tunnel automatically.")
+
+
+class LocalServerController:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self._server: uvicorn.Server | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def local_base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="info")
+        self._server = uvicorn.Server(config)
+        self._thread = threading.Thread(target=self._server.run, daemon=True)
+        self._thread.start()
+
+    def wait_until_started(self, timeout_seconds: float = 20.0) -> None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if self.is_running():
+                return
+            time.sleep(0.2)
+        raise RuntimeError("ScratchLink server did not start in time.")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def is_running(self) -> bool:
+        return bool(self._server and getattr(self._server, "started", False))
+
+
+class TunnelController:
+    def __init__(self, cloudflared_path: str, local_url: str):
+        self.cloudflared_path = cloudflared_path
+        self.local_url = local_url
+        self._process: subprocess.Popen[str] | None = None
+        self._public_url: str | None = None
+
+    @property
+    def public_url(self) -> str:
+        if not self._public_url:
+            raise RuntimeError("Cloudflare Tunnel is not ready yet.")
+        return self._public_url
+
+    def start(self, progress: Callable[[str], None] | None = None) -> str:
+        if progress:
+            progress("Opening a public Cloudflare URL for ScratchLink...")
+
+        command = [self.cloudflared_path, "tunnel", "--url", self.local_url, "--no-autoupdate"]
+        self._process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        url_holder = {"url": None}
+
+        def collect() -> None:
+            if not self._process or not self._process.stdout:
+                return
+            for line in self._process.stdout:
+                text = line.strip()
+                if progress and text:
+                    lowered = text.lower()
+                    if "trycloudflare.com" in lowered or "registered" in lowered or "starting" in lowered:
+                        progress(text)
+                if "https://" in text and "trycloudflare.com" in text and not url_holder["url"]:
+                    for token in text.split():
+                        if token.startswith("https://") and "trycloudflare.com" in token:
+                            url_holder["url"] = token.rstrip("/")
+                            self._public_url = url_holder["url"]
+                            return
+
+        thread = threading.Thread(target=collect, daemon=True)
+        thread.start()
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if url_holder["url"]:
+                return url_holder["url"]
+            if self._process and self._process.poll() is not None:
+                break
+            time.sleep(0.3)
+
+        self.stop()
+        raise RuntimeError("ScratchLink could not open a Cloudflare URL.")
+
+    def stop(self) -> None:
+        if self._process is None:
+            return
+        with suppress(OSError):
+            self._process.terminate()
+        with suppress(Exception):
+            self._process.wait(timeout=3)
+
+
+class StartupGate:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.server = LocalServerController(host, port)
+        self.tunnel: TunnelController | None = None
+        self.root = tk.Tk()
+        self.root.title("ScratchLink")
+        self.root.geometry("520x250")
+        self.root.resizable(False, False)
+        self.root.configure(bg="#eef3f8")
+        self.status_var = tk.StringVar(value="Preparing ScratchLink...")
+        self.detail_var = tk.StringVar(value="The app is setting up Cloudflare Tunnel before anything can be used.")
+        self.error: Exception | None = None
+        self.ready = threading.Event()
+
+        shell = tk.Frame(self.root, bg="#eef3f8", padx=28, pady=28)
+        shell.pack(fill="both", expand=True)
+        card = tk.Frame(shell, bg="#ffffff", highlightthickness=1, highlightbackground="#d8e3ee", padx=22, pady=22)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(card, text="ScratchLink", bg="#ffffff", fg="#16324f", font=("Segoe UI", 22, "bold")).pack(anchor="w")
+        tk.Label(
+            card,
+            text="Cloudflare Tunnel is required before the app unlocks.",
+            bg="#ffffff",
+            fg="#4e647a",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(6, 18))
+        ttk.Progressbar(card, mode="indeterminate").pack(fill="x")
+        self.progressbar = card.winfo_children()[-1]
+        self.progressbar.start(10)
+        tk.Label(card, textvariable=self.status_var, bg="#ffffff", fg="#16324f", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(18, 4))
+        tk.Label(card, textvariable=self.detail_var, bg="#ffffff", fg="#5f7388", justify="left", wraplength=420, font=("Segoe UI", 10)).pack(anchor="w")
+
+    def set_status(self, message: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(message))
+
+    def set_detail(self, message: str) -> None:
+        self.root.after(0, lambda: self.detail_var.set(message))
+
+    def run(self) -> tuple[LocalServerController, TunnelController]:
+        worker = threading.Thread(target=self._bootstrap, daemon=True)
+        worker.start()
+        self.root.after(200, self._poll)
+        self.root.mainloop()
+        if self.error is not None:
+            raise self.error
+        if self.tunnel is None:
+            raise RuntimeError("ScratchLink did not finish startup.")
+        return self.server, self.tunnel
+
+    def _poll(self) -> None:
+        if self.ready.is_set():
+            self.progressbar.stop()
+            self.root.destroy()
+            return
+        self.root.after(200, self._poll)
+
+    def _bootstrap(self) -> None:
+        try:
+            self.set_status("Checking Cloudflare Tunnel...")
+            cloudflared_path = ensure_cloudflared(self.set_detail)
+            self.set_status("Starting the local ScratchLink server...")
+            self.server.start()
+            self.server.wait_until_started()
+            self.set_status("Opening a public ScratchLink URL...")
+            self.tunnel = TunnelController(cloudflared_path, self.server.local_base_url)
+            public_url = self.tunnel.start(self.set_detail)
+            STATE.local_base_url = self.server.local_base_url
+            STATE.public_base_url = public_url
+            self.set_status("ScratchLink is ready.")
+            self.set_detail("Cloudflare Tunnel is online and the app is unlocking now.")
+            self.ready.set()
+        except Exception as exc:
+            self.error = exc
+            self.set_status("ScratchLink could not finish startup.")
+            self.set_detail(str(exc))
+            self.ready.set()
+
+
+class ScratchLinkApp(ttk.Frame):
+    def __init__(self, root: tk.Tk, store: ConnectionStore, server: LocalServerController, tunnel: TunnelController):
+        super().__init__(root, padding=18)
+        self.root = root
+        self.store = store
+        self.server = server
+        self.tunnel = tunnel
+        self.selected_connection_id: str | None = None
+        self.connection_cards: dict[str, tk.Frame] = {}
+
+        self.status_var = tk.StringVar(value="Cloudflare Tunnel is live")
+        self.api_url_var = tk.StringVar(value=STATE.api_base_url())
+        self.docs_url_var = tk.StringVar(value=f"{STATE.api_base_url()}/docs")
+        self.connection_count_var = tk.StringVar(value="0")
+        self.active_count_var = tk.StringVar(value="0")
+        self.detail_name_var = tk.StringVar(value="")
+        self.detail_status_var = tk.StringVar(value="")
+        self.detail_id_var = tk.StringVar(value="")
+        self.detail_password_var = tk.StringVar(value="")
+        self.detail_last_used_var = tk.StringVar(value="Never")
+        self.detail_extension_url_var = tk.StringVar(value="")
+
+        self._configure_style()
+        self._build_menu()
+        self._build_layout()
+
+        if not self.store.count():
+            created = self.store.create_connection("Main Connection")
+            self.selected_connection_id = created.id
+
+        self.refresh_connections()
+        self.root.after(1400, self._refresh_loop)
+
+    def _configure_style(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        self.root.configure(bg="#f0f4f7")
+        style.configure("App.TFrame", background="#f0f4f7")
+        style.configure("Card.TFrame", background="#ffffff")
+        style.configure("Title.TLabel", background="#f0f4f7", foreground="#17324d", font=("Segoe UI", 24, "bold"))
+        style.configure("Subtle.TLabel", background="#f0f4f7", foreground="#54697d", font=("Segoe UI", 10))
+        style.configure("CardTitle.TLabel", background="#ffffff", foreground="#17324d", font=("Segoe UI", 12, "bold"))
+        style.configure("CardBody.TLabel", background="#ffffff", foreground="#3f5972", font=("Segoe UI", 10))
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("TNotebook", background="#f0f4f7")
+        style.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 10, "bold"))
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="New Connection", command=self.create_connection)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Connections", command=self.store.save)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="Copy Public API URL", command=lambda: self.copy_text(STATE.api_base_url(), "Public API URL copied."))
+        help_menu.add_command(label="Copy Public Docs URL", command=lambda: self.copy_text(f'{STATE.api_base_url()}/docs', "Public docs URL copied."))
+        help_menu.add_separator()
+        help_menu.add_command(label="About ScratchLink", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        self.root.config(menu=menubar)
+
+    def _build_layout(self) -> None:
+        self.pack(fill="both", expand=True)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(self, style="App.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="ScratchLink", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Public Cloudflare URL, named connection cards, and per-request password verification.",
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(header, textvariable=self.status_var, style="Subtle.TLabel").grid(row=0, column=1, rowspan=2, sticky="e")
+
+        summary = ttk.Frame(self, style="App.TFrame")
+        summary.grid(row=1, column=0, sticky="ew", pady=(18, 14))
+        for column in range(3):
+            summary.columnconfigure(column, weight=1)
+
+        self._build_summary_card(summary, 0, "Connections", self.connection_count_var, "Saved connection cards in the app.")
+        self._build_summary_card(summary, 1, "Enabled", self.active_count_var, "Connections currently allowed to send actions.")
+        self._build_summary_card(summary, 2, "Public URL", self.api_url_var, "This Cloudflare URL is the one used by the extension and API.")
+
+        notebook = ttk.Notebook(self)
+        notebook.grid(row=2, column=0, sticky="nsew")
+
+        connections_tab = ttk.Frame(notebook, padding=16)
+        server_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(connections_tab, text="Connections")
+        notebook.add(server_tab, text="Server")
+
+        self._build_connections_tab(connections_tab)
+        self._build_server_tab(server_tab)
+
+    def _build_summary_card(self, parent: ttk.Frame, column: int, title: str, value_var: tk.StringVar, description: str) -> None:
+        card = ttk.Frame(parent, style="Card.TFrame", padding=16)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+        parent.columnconfigure(column, weight=1)
+        ttk.Label(card, text=title, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, textvariable=value_var, style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(card, text=description, style="CardBody.TLabel", wraplength=260, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+    def _build_connections_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=5)
+        parent.columnconfigure(1, weight=3)
+        parent.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(parent, style="App.TFrame")
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        ttk.Button(toolbar, text="New Connection", style="Accent.TButton", command=self.create_connection).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(toolbar, text="Copy Extension Link", command=self.copy_extension_link).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(toolbar, text="Turn On or Off", command=self.toggle_selected).grid(row=0, column=2)
+
+        card_shell = ttk.Frame(parent, style="Card.TFrame", padding=10)
+        card_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        card_shell.columnconfigure(0, weight=1)
+        card_shell.rowconfigure(0, weight=1)
+
+        self.card_canvas = tk.Canvas(card_shell, bg="#ffffff", highlightthickness=0)
+        self.card_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(card_shell, orient="vertical", command=self.card_canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.card_canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.cards_frame = tk.Frame(self.card_canvas, bg="#ffffff")
+        self.cards_window = self.card_canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
+        self.cards_frame.bind("<Configure>", lambda _event: self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all")))
+        self.card_canvas.bind("<Configure>", self._on_cards_canvas_resize)
+
+        details = ttk.Frame(parent, style="Card.TFrame", padding=18)
+        details.grid(row=1, column=1, sticky="nsew")
+        details.columnconfigure(0, weight=1)
+
+        ttk.Label(details, text="Selected Connection", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            details,
+            text="Cards glow green when enabled and red when disabled. Use the pencil menu on a card to edit it quickly.",
+            style="CardBody.TLabel",
+            wraplength=340,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 16))
+
+        detail_rows = [
+            ("Name", self.detail_name_var),
+            ("Status", self.detail_status_var),
+            ("Connection ID", self.detail_id_var),
+            ("Password", self.detail_password_var),
+            ("Last Used", self.detail_last_used_var),
+            ("Extension Link", self.detail_extension_url_var),
+        ]
+
+        for index, (label, variable) in enumerate(detail_rows, start=2):
+            ttk.Label(details, text=label, style="CardTitle.TLabel").grid(row=index * 2, column=0, sticky="w")
+            entry = ttk.Entry(details, textvariable=variable)
+            entry.grid(row=index * 2 + 1, column=0, sticky="ew", pady=(4, 10))
+            entry.state(["readonly"])
+
+        button_row = ttk.Frame(details, style="Card.TFrame")
+        button_row.grid(row=18, column=0, sticky="ew", pady=(8, 0))
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=1)
+        ttk.Button(button_row, text="Copy Password", command=self.copy_password).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(button_row, text="Regenerate Password", command=self.regenerate_selected).grid(row=0, column=1, sticky="ew")
+        ttk.Button(button_row, text="Rename", command=self.rename_selected).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Button(button_row, text="Delete", command=self.delete_selected).grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+    def _build_server_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        card = ttk.Frame(parent, style="Card.TFrame", padding=18)
+        card.grid(row=0, column=0, sticky="nsew")
+        card.columnconfigure(0, weight=1)
+
+        ttk.Label(card, text="Server", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            card,
+            text="ScratchLink now serves everything through a public Cloudflare URL. The extension and API both use that address instead of localhost.",
+            style="CardBody.TLabel",
+            wraplength=720,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 18))
+
+        rows = [
+            ("Public API URL", self.api_url_var),
+            ("Public Docs URL", self.docs_url_var),
+            ("Status", self.status_var),
+        ]
+
+        for index, (label, variable) in enumerate(rows, start=2):
+            ttk.Label(card, text=label, style="CardTitle.TLabel").grid(row=index * 2, column=0, sticky="w")
+            entry = ttk.Entry(card, textvariable=variable)
+            entry.grid(row=index * 2 + 1, column=0, sticky="ew", pady=(4, 12))
+            entry.state(["readonly"])
+
+        actions = ttk.Frame(card, style="Card.TFrame")
+        actions.grid(row=10, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(actions, text="Copy Public API URL", command=lambda: self.copy_text(STATE.api_base_url(), "Public API URL copied.")).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Copy Public Docs URL", command=lambda: self.copy_text(f"{STATE.api_base_url()}/docs", "Public docs URL copied.")).grid(row=0, column=1)
+
+    def _on_cards_canvas_resize(self, event: tk.Event) -> None:
+        self.card_canvas.itemconfigure(self.cards_window, width=event.width)
+        self.refresh_connection_cards()
+
+    def _refresh_loop(self) -> None:
+        self.refresh_connections()
+        self.root.after(1400, self._refresh_loop)
+
+    def refresh_connections(self) -> None:
+        connections = self.store.list_connections()
+        active_count = sum(1 for item in connections if item.enabled)
+        self.connection_count_var.set(str(len(connections)))
+        self.active_count_var.set(str(active_count))
+        self.api_url_var.set(STATE.api_base_url())
+        self.docs_url_var.set(f"{STATE.api_base_url()}/docs")
+        self.status_var.set("Cloudflare Tunnel is live" if self.server.is_running() else "Waiting for ScratchLink server")
+
+        if self.selected_connection_id and any(item.id == self.selected_connection_id for item in connections):
+            pass
+        elif connections:
+            self.selected_connection_id = connections[0].id
+        else:
+            self.selected_connection_id = None
+
+        self.refresh_connection_cards(connections)
+        self.refresh_details()
+
+    def refresh_connection_cards(self, connections: list[ConnectionRecord] | None = None) -> None:
+        if connections is None:
+            connections = self.store.list_connections()
+
+        for widget in self.cards_frame.winfo_children():
+            widget.destroy()
+        self.connection_cards.clear()
+
+        if not connections:
+            empty = tk.Label(self.cards_frame, text="No connections yet.", bg="#ffffff", fg="#54697d", font=("Segoe UI", 11))
+            empty.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+            return
+
+        width = max(self.card_canvas.winfo_width(), 640)
+        columns = 3 if width > 980 else 2 if width > 620 else 1
+
+        for column in range(columns):
+            self.cards_frame.grid_columnconfigure(column, weight=1)
+
+        for index, connection in enumerate(connections):
+            row = index // columns
+            column = index % columns
+            card = self._create_connection_card(self.cards_frame, connection)
+            card.grid(row=row, column=column, padx=10, pady=10, sticky="nsew")
+            self.connection_cards[connection.id] = card
+
+    def _create_connection_card(self, parent: tk.Frame, connection: ConnectionRecord) -> tk.Frame:
+        enabled = connection.enabled
+        accent = "#3dbb70" if enabled else "#d95b63"
+        accent_soft = "#ecfbf1" if enabled else "#fff0f1"
+        border = "#f0c24c" if connection.id == self.selected_connection_id else accent
+
+        outer = tk.Frame(parent, bg=border, highlightthickness=0, bd=0)
+        card = tk.Frame(outer, bg="#ffffff", padx=14, pady=14)
+        card.pack(fill="both", expand=True, padx=2, pady=2)
+        top = tk.Frame(card, bg="#ffffff")
+        top.pack(fill="x")
+
+        status_badge = tk.Label(
+            top,
+            text="Enabled" if enabled else "Disabled",
+            bg=accent_soft,
+            fg=accent,
+            padx=10,
+            pady=4,
+            font=("Segoe UI", 9, "bold"),
+        )
+        status_badge.pack(side="left")
+
+        edit_button = tk.Button(
+            top,
+            text="✎",
+            bg="#ffffff",
+            fg="#40586f",
+            activebackground="#ffffff",
+            activeforeground="#17324d",
+            bd=0,
+            font=("Segoe UI Symbol", 13),
+            cursor="hand2",
+            command=lambda cid=connection.id: self.open_connection_menu(cid),
+        )
+        edit_button.pack(side="right")
+
+        tk.Label(card, text=connection.name, bg="#ffffff", fg="#17324d", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(12, 4))
+        tk.Label(card, text=shorten_connection_id(connection.id), bg="#ffffff", fg="#607489", font=("Consolas", 10)).pack(anchor="w")
+        tk.Label(card, text=f"Last used: {format_timestamp(connection.last_used_at)}", bg="#ffffff", fg="#50657b", font=("Segoe UI", 9)).pack(anchor="w", pady=(12, 0))
+
+        footer = tk.Frame(card, bg="#ffffff")
+        footer.pack(fill="x", pady=(14, 0))
+        tk.Label(footer, text="Public link ready", bg="#ffffff", fg=accent, font=("Segoe UI", 9, "bold")).pack(side="left")
+        quick = tk.Button(
+            footer,
+            text="Select",
+            bg=accent,
+            fg="#ffffff",
+            activebackground=accent,
+            activeforeground="#ffffff",
+            bd=0,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+            command=lambda cid=connection.id: self.select_connection(cid),
+        )
+        quick.pack(side="right")
+
+        for widget in (outer, card, top, status_badge):
+            widget.bind("<Button-1>", lambda _event, cid=connection.id: self.select_connection(cid))
+
+        return outer
+
+    def select_connection(self, connection_id: str) -> None:
+        self.selected_connection_id = connection_id
+        self.refresh_connections()
+
+    def open_connection_menu(self, connection_id: str) -> None:
+        self.selected_connection_id = connection_id
+        self.refresh_details()
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="Rename", command=self.rename_selected)
+        menu.add_command(label="Turn On or Off", command=self.toggle_selected)
+        menu.add_command(label="Copy Extension Link", command=self.copy_extension_link)
+        menu.add_command(label="Copy Password", command=self.copy_password)
+        menu.add_command(label="Regenerate Password", command=self.regenerate_selected)
+        menu.add_separator()
+        menu.add_command(label="Delete", command=self.delete_selected)
+        x = self.root.winfo_pointerx()
+        y = self.root.winfo_pointery()
+        menu.tk_popup(x, y)
+        menu.grab_release()
+
+    def refresh_details(self) -> None:
+        if not self.selected_connection_id:
+            for variable in (
+                self.detail_name_var,
+                self.detail_status_var,
+                self.detail_id_var,
+                self.detail_password_var,
+                self.detail_last_used_var,
+                self.detail_extension_url_var,
+            ):
+                variable.set("")
+            return
+
+        connection = self.store.get(self.selected_connection_id)
+        if connection is None:
+            self.selected_connection_id = None
+            self.refresh_details()
+            return
+
+        self.detail_name_var.set(connection.name)
+        self.detail_status_var.set("Enabled" if connection.enabled else "Disabled")
+        self.detail_id_var.set(connection.id)
+        self.detail_password_var.set(connection.password)
+        self.detail_last_used_var.set(format_timestamp(connection.last_used_at))
+        self.detail_extension_url_var.set(self.make_extension_url(connection))
+
+    def make_extension_url(self, connection: ConnectionRecord) -> str:
+        return f"{STATE.api_base_url().rstrip('/')}/extension/{connection.id}.js?password={quote(connection.password)}"
+
+    def copy_text(self, text: str, message: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(message)
+
+    def get_selected_connection(self) -> ConnectionRecord | None:
+        if not self.selected_connection_id:
+            messagebox.showinfo("ScratchLink", "Choose a connection first.")
+            return None
+        connection = self.store.get(self.selected_connection_id)
+        if connection is None:
+            messagebox.showinfo("ScratchLink", "That connection is no longer available.")
+            self.refresh_connections()
+            return None
+        return connection
+
+    def create_connection(self) -> None:
+        name = simpledialog.askstring("New Connection", "Choose a name for the new connection:", parent=self.root)
+        connection = self.store.create_connection(name)
+        self.selected_connection_id = connection.id
+        self.refresh_connections()
+        self.copy_text(self.make_extension_url(connection), "New connection created and extension link copied.")
+
+    def rename_selected(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        new_name = simpledialog.askstring("Rename Connection", "Choose a new name:", initialvalue=connection.name, parent=self.root)
+        if new_name is None:
+            return
+        try:
+            updated = self.store.rename_connection(connection.id, new_name)
+        except ValueError as exc:
+            messagebox.showerror("ScratchLink", str(exc))
+            return
+        self.selected_connection_id = updated.id
+        self.refresh_connections()
+
+    def toggle_selected(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        updated = self.store.toggle_connection(connection.id)
+        self.selected_connection_id = updated.id
+        self.refresh_connections()
+
+    def copy_extension_link(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        self.copy_text(self.make_extension_url(connection), "Extension link copied.")
+
+    def copy_password(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        self.copy_text(connection.password, "Password copied.")
+
+    def regenerate_selected(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        confirmed = messagebox.askyesno(
+            "Regenerate Password",
+            "This will disconnect any project still using the old password. Continue?",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        updated = self.store.regenerate_password(connection.id)
+        self.selected_connection_id = updated.id
+        self.refresh_connections()
+        self.copy_text(self.make_extension_url(updated), "New extension link copied after password reset.")
+
+    def delete_selected(self) -> None:
+        connection = self.get_selected_connection()
+        if connection is None:
+            return
+        confirmed = messagebox.askyesno(
+            "Delete Connection",
+            f"Delete '{connection.name}'? Projects using it will stop working until you add a new connection.",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self.store.delete_connection(connection.id)
+        if not self.store.count():
+            created = self.store.create_connection("Main Connection")
+            self.selected_connection_id = created.id
+        else:
+            self.selected_connection_id = None
+        self.refresh_connections()
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "About ScratchLink",
+            "ScratchLink is a local desktop bridge for PenguinMod projects, now routed through a public Cloudflare URL.",
+            parent=self.root,
+        )
+
+    def on_close(self) -> None:
+        self.store.save()
+        self.root.destroy()
+
+
+def build_root_window() -> tk.Tk:
+    root = tk.Tk()
+    root.title("ScratchLink")
+    root.geometry("1220x790")
+    root.minsize(1060, 720)
+    return root
+
+
+LOADING_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScratchLink</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef3f7;
+      --panel: rgba(255,255,255,0.92);
+      --ink: #17324d;
+      --soft: #5a7188;
+      --line: #d8e2ec;
+      --accent: #1f8f68;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(31,143,104,0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(25,92,146,0.14), transparent 26%),
+        var(--bg);
+      color: var(--ink);
+      display: grid;
+      place-items: center;
+    }
+    .panel {
+      width: min(560px, calc(100vw - 48px));
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 28px;
+      box-shadow: 0 28px 72px rgba(23, 50, 77, 0.14);
+      backdrop-filter: blur(10px);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+    }
+    p {
+      margin: 0;
+      color: var(--soft);
+      line-height: 1.5;
+    }
+    .bar {
+      margin: 22px 0 18px;
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      background: #e5edf5;
+      overflow: hidden;
+    }
+    .bar span {
+      display: block;
+      width: 48%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #1f8f68, #46c697);
+      transform: translateX(-100%);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    .status {
+      margin-top: 14px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .detail {
+      margin-top: 8px;
+      font-size: 14px;
+      color: var(--soft);
+    }
+    @keyframes pulse {
+      0% { transform: translateX(0%); }
+      50% { transform: translateX(108%); }
+      100% { transform: translateX(0%); }
+    }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <h1>ScratchLink</h1>
+    <p>The app is preparing Cloudflare and bringing the dashboard online.</p>
+    <div class="bar"><span></span></div>
+    <div class="status" id="status">Preparing ScratchLink...</div>
+    <div class="detail" id="detail">Please wait while the public connection is created.</div>
+  </section>
+  <script>
+    window.setScratchLinkStatus = function(status, detail) {
+      document.getElementById('status').textContent = status || '';
+      document.getElementById('detail').textContent = detail || '';
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+def update_loading_window(window: webview.Window, status: str, detail: str) -> None:
+    escaped_status = json.dumps(status)
+    escaped_detail = json.dumps(detail)
+    with suppress(Exception):
+        window.evaluate_js(f"window.setScratchLinkStatus({escaped_status}, {escaped_detail});")
+
+
+def bootstrap_webview(window: webview.Window, host: str, port: int) -> tuple[LocalServerController, TunnelController]:
+    update_loading_window(window, "Checking Cloudflare Tunnel...", "ScratchLink is making sure the tunnel tool is ready.")
+    cloudflared_path = ensure_cloudflared(lambda message: update_loading_window(window, "Preparing Cloudflare Tunnel...", message))
+
+    STATE.store = ConnectionStore(CONNECTIONS_FILE)
+    if not STATE.store.count():
+        STATE.store.create_connection("Main Connection")
+
+    update_loading_window(window, "Starting the local ScratchLink server...", "The background API is coming online.")
+    server = LocalServerController(host, port)
+    server.start()
+    server.wait_until_started()
+
+    update_loading_window(window, "Opening a public ScratchLink URL...", "Cloudflare is publishing the app URL now.")
+    tunnel = TunnelController(cloudflared_path, server.local_base_url)
+    public_url = tunnel.start(lambda message: update_loading_window(window, "Opening a public ScratchLink URL...", message))
+
+    STATE.local_base_url = server.local_base_url
+    STATE.public_base_url = public_url
+
+    update_loading_window(window, "Opening the ScratchLink dashboard...", "The HTML interface is loading.")
+    window.load_url(f"{server.local_base_url}/app?token={quote(STATE.admin_token)}")
+    return server, tunnel
+
+
 def main() -> None:
-    global EXTENSION_TEMPLATE
-
-    parser = argparse.ArgumentParser(description="Host a local API for the PenguinMod extension.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument(
-        "--tunnel",
-        choices=["cloudflare", "none"],
-        default="cloudflare",
-        help="Expose the local API over Cloudflare Tunnel if possible.",
-    )
+    parser = argparse.ArgumentParser(description="Launch the ScratchLink desktop app.")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
-    EXTENSION_TEMPLATE = load_extension_template()
 
-    public_url = None
-    if args.tunnel == "cloudflare":
-        public_url = start_tunnel(args.port)
+    STATE.extension_template = load_extension_template()
+    STATE.local_base_url = f"http://{args.host}:{args.port}"
+    STATE.public_base_url = ""
+    server: LocalServerController | None = None
+    tunnel: TunnelController | None = None
+    startup_error: Exception | None = None
 
-    local_base_url = f"http://{args.host}:{args.port}"
-    local_extension_url = f"{local_base_url}/extension/{SESSION_ID}.js"
+    def startup(_window: webview.Window) -> None:
+        nonlocal server, tunnel, startup_error
+        try:
+            server, tunnel = bootstrap_webview(window, args.host, args.port)
+        except Exception as exc:
+            startup_error = exc
+            update_loading_window(window, "ScratchLink could not start.", str(exc))
 
-    print(f"Local API: {local_base_url}")
-    print(f"Session ID: {SESSION_ID}")
-    print(f"Extension URL: {local_extension_url}")
-    if public_url:
-        print(f"Public API: {public_url}")
-        print(f"Public extension URL: {public_url}/extension/{SESSION_ID}.js")
-    else:
-        print("No public tunnel could be opened. The local server will still start.")
+    window = webview.create_window(
+        "ScratchLink",
+        html=LOADING_HTML,
+        width=1260,
+        height=820,
+        min_size=(1080, 720),
+        background_color="#eef3f7",
+    )
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    try:
+        webview.start(startup, window)
+    finally:
+        if STATE.store is not None:
+            with suppress(OSError):
+                STATE.store.save()
+        if tunnel is not None:
+            tunnel.stop()
+        if server is not None:
+            server.stop()
+
+    if startup_error is not None:
+        raise startup_error
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+fastapi
+mss
+pyautogui
+pydantic
+pywebview
+uvicorn
