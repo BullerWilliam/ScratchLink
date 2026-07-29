@@ -6,10 +6,13 @@ import os
 import platform
 import secrets
 import shutil
+import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.request
 import uuid
 from contextlib import suppress
@@ -17,7 +20,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import mss
 import mss.tools
@@ -34,6 +37,10 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+LOCAL_PYTHON_DEPS = os.path.join(HERE, "deps")
+if os.path.isdir(LOCAL_PYTHON_DEPS) and LOCAL_PYTHON_DEPS not in sys.path:
+    sys.path.insert(0, LOCAL_PYTHON_DEPS)
+os.environ.setdefault("HF_HOME", os.path.join(HERE, "hf_cache"))
 EXTENSION_FILE = os.path.join(HERE, "scratchlink_penguinmod.js")
 CONNECTIONS_FILE = os.path.join(HERE, "scratchlink_connections.json")
 TOOLS_DIR = os.path.join(HERE, "tools")
@@ -42,6 +49,7 @@ CLOUDFLARED_FALLBACK_PATH = os.path.join(TOOLS_DIR, "cloudflared.exe")
 CLOUDFLARED_DOWNLOAD_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_AI_MODEL = "google/flan-t5-base"
 
 
 def now_iso() -> str:
@@ -392,6 +400,496 @@ def parse_headers_json(value: str) -> dict[str, str]:
     return {str(key): str(item) for key, item in parsed.items()}
 
 
+def perform_outbound_http_request(method: str, url: str, headers: dict[str, str], body: str = "") -> dict[str, Any]:
+    cleaned_method = str(method or "").strip().upper()
+    cleaned_url = str(url or "").strip()
+    if cleaned_method not in {"GET", "POST"}:
+        raise HTTPException(status_code=400, detail="Only GET and POST requests are supported")
+    if not cleaned_url:
+        raise HTTPException(status_code=400, detail="A URL is required")
+
+    parsed = urlparse(cleaned_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
+    payload = None
+    outbound_headers = dict(headers)
+    if cleaned_method == "POST":
+        payload = str(body or "").encode("utf-8")
+        if not any(key.lower() == "content-type" for key in outbound_headers):
+            outbound_headers["Content-Type"] = "text/plain; charset=utf-8"
+
+    request = urllib.request.Request(cleaned_url, data=payload, headers=outbound_headers, method=cleaned_method)
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status": int(response.status),
+                "headers": {str(key): str(value) for key, value in response.headers.items()},
+                "body": response_body,
+            }
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": True,
+            "status": int(exc.code),
+            "headers": {str(key): str(value) for key, value in exc.headers.items()},
+            "body": response_body,
+        }
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"ScratchLink could not reach that URL: {exc.reason}") from exc
+
+
+@dataclass
+class ScreenObjectRecord:
+    kind: str
+    object_id: str
+    x: int
+    y: int
+    width: int = 0
+    height: int = 0
+    text: str = ""
+    background: str = "#ffffff"
+    color: str = "#17324d"
+    font_size: int = 18
+
+
+@dataclass
+class ScreenAnalyticRecord:
+    analytic_id: str
+    name: str
+    value: str
+    kind: str = "value"
+
+
+@dataclass
+class ScreenStateRecord:
+    mode: str = "objects"
+    width: int = 64
+    height: int = 64
+    objects: list[ScreenObjectRecord] | None = None
+    analytics: list[ScreenAnalyticRecord] | None = None
+    pixels: dict[str, str] | None = None
+    image_data_uri: str = ""
+    pressed_button_ids: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.objects is None:
+            self.objects = []
+        if self.analytics is None:
+            self.analytics = []
+        if self.pixels is None:
+            self.pixels = {}
+        if self.pressed_button_ids is None:
+            self.pressed_button_ids = []
+
+
+class ScreenManager:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._screens: dict[str, ScreenStateRecord] = {}
+
+    @staticmethod
+    def _normalize_analytic_kind(kind: str) -> str:
+        cleaned = str(kind or "").strip().lower()
+        return "progress" if cleaned == "progress" else "value"
+
+    @staticmethod
+    def _normalize_progress_value(value: str) -> str:
+        try:
+            number = float(str(value or "0").strip() or "0")
+        except ValueError:
+            number = 0.0
+        clamped = min(100.0, max(0.0, number))
+        if clamped.is_integer():
+            return str(int(clamped))
+        return f"{clamped:.2f}".rstrip("0").rstrip(".")
+
+    def _get_or_create_locked(self, connection_id: str) -> ScreenStateRecord:
+        state = self._screens.get(connection_id)
+        if state is None:
+            state = ScreenStateRecord()
+            self._screens[connection_id] = state
+        return state
+
+    def get_state(self, connection_id: str) -> ScreenStateRecord:
+        with self._lock:
+            return self._get_or_create_locked(connection_id)
+
+    def clear_screen(self, connection_id: str) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            state.objects.clear()
+            state.analytics.clear()
+            state.pixels.clear()
+            state.image_data_uri = ""
+            state.pressed_button_ids.clear()
+            return state
+
+    def set_mode(self, connection_id: str, mode: str) -> ScreenStateRecord:
+        cleaned = str(mode or "").strip().lower()
+        if cleaned not in {"objects", "pixels", "image", "analytics"}:
+            raise HTTPException(status_code=400, detail="Screen mode must be objects, analytics, or pixels/image")
+        normalized = "pixels" if cleaned in {"pixels", "image"} else cleaned
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            state.mode = normalized
+            state.objects.clear()
+            state.analytics.clear()
+            state.pixels.clear()
+            state.image_data_uri = ""
+            state.pressed_button_ids.clear()
+            return state
+
+    def add_button(
+        self,
+        connection_id: str,
+        object_id: str,
+        text: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        background: str,
+        color: str,
+    ) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            state.objects.append(
+                ScreenObjectRecord(
+                    kind="button",
+                    object_id=str(object_id or "").strip() or uuid.uuid4().hex,
+                    text=str(text or ""),
+                    x=int(x),
+                    y=int(y),
+                    width=max(int(width), 1),
+                    height=max(int(height), 1),
+                    background=str(background or "#ffffff"),
+                    color=str(color or "#17324d"),
+                )
+            )
+            return state
+
+    def add_text(
+        self,
+        connection_id: str,
+        object_id: str,
+        text: str,
+        x: int,
+        y: int,
+        color: str,
+        font_size: int,
+    ) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            state.objects.append(
+                ScreenObjectRecord(
+                    kind="text",
+                    object_id=str(object_id or "").strip() or uuid.uuid4().hex,
+                    text=str(text or ""),
+                    x=int(x),
+                    y=int(y),
+                    color=str(color or "#17324d"),
+                    font_size=max(int(font_size), 1),
+                )
+            )
+            return state
+
+    def update_text(self, connection_id: str, object_id: str, text: str) -> ScreenStateRecord:
+        target_id = str(object_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="A text object id is required")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            for item in state.objects:
+                if item.kind == "text" and item.object_id == target_id:
+                    item.text = str(text or "")
+                    return state
+        raise HTTPException(status_code=404, detail="That text object was not found")
+
+    def update_button_text(self, connection_id: str, object_id: str, text: str) -> ScreenStateRecord:
+        target_id = str(object_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="A button object id is required")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            for item in state.objects:
+                if item.kind == "button" and item.object_id == target_id:
+                    item.text = str(text or "")
+                    return state
+        raise HTTPException(status_code=404, detail="That button object was not found")
+
+    def add_box(
+        self,
+        connection_id: str,
+        object_id: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        background: str,
+    ) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            state.objects.append(
+                ScreenObjectRecord(
+                    kind="box",
+                    object_id=str(object_id or "").strip() or uuid.uuid4().hex,
+                    x=int(x),
+                    y=int(y),
+                    width=max(int(width), 1),
+                    height=max(int(height), 1),
+                    background=str(background or "#cccccc"),
+                )
+            )
+            return state
+
+    def remove_object(self, connection_id: str, object_id: str) -> ScreenStateRecord:
+        target_id = str(object_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="An object id is required")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "objects":
+                raise HTTPException(status_code=409, detail="Screen must be in objects mode")
+            remaining = [item for item in state.objects if item.object_id != target_id]
+            if len(remaining) == len(state.objects):
+                raise HTTPException(status_code=404, detail="That object was not found")
+            state.objects = remaining
+            return state
+
+    def add_analytic(self, connection_id: str, analytic_id: str, name: str, value: str, kind: str) -> ScreenStateRecord:
+        target_id = str(analytic_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="An analytic id is required")
+        normalized_kind = self._normalize_analytic_kind(kind)
+        normalized_value = self._normalize_progress_value(value) if normalized_kind == "progress" else str(value or "")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "analytics":
+                raise HTTPException(status_code=409, detail="Screen must be in analytics mode")
+            for item in state.analytics:
+                if item.analytic_id == target_id:
+                    item.kind = normalized_kind
+                    item.name = str(name or item.name or target_id)
+                    item.value = normalized_value
+                    return state
+            state.analytics.append(
+                ScreenAnalyticRecord(
+                    analytic_id=target_id,
+                    name=str(name or target_id),
+                    kind=normalized_kind,
+                    value=normalized_value,
+                )
+            )
+            return state
+
+    def update_analytic_value(self, connection_id: str, analytic_id: str, value: str) -> ScreenStateRecord:
+        target_id = str(analytic_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="An analytic id is required")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "analytics":
+                raise HTTPException(status_code=409, detail="Screen must be in analytics mode")
+            for item in state.analytics:
+                if item.analytic_id == target_id:
+                    item.value = self._normalize_progress_value(value) if item.kind == "progress" else str(value or "")
+                    return state
+        raise HTTPException(status_code=404, detail="That analytic was not found")
+
+    def remove_analytic(self, connection_id: str, analytic_id: str) -> ScreenStateRecord:
+        target_id = str(analytic_id or "").strip()
+        if not target_id:
+            raise HTTPException(status_code=400, detail="An analytic id is required")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "analytics":
+                raise HTTPException(status_code=409, detail="Screen must be in analytics mode")
+            remaining = [item for item in state.analytics if item.analytic_id != target_id]
+            if len(remaining) == len(state.analytics):
+                raise HTTPException(status_code=404, detail="That analytic was not found")
+            state.analytics = remaining
+            return state
+
+    def set_resolution(self, connection_id: str, width: int, height: int) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "pixels":
+                raise HTTPException(status_code=409, detail="Screen must be in pixels/image mode")
+            state.width = max(int(width), 1)
+            state.height = max(int(height), 1)
+            state.pixels.clear()
+            state.image_data_uri = ""
+            return state
+
+    def set_pixel(self, connection_id: str, x: int, y: int, color: str) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "pixels":
+                raise HTTPException(status_code=409, detail="Screen must be in pixels/image mode")
+            pixel_x = int(x)
+            pixel_y = int(y)
+            if pixel_x < 0 or pixel_y < 0 or pixel_x >= state.width or pixel_y >= state.height:
+                raise HTTPException(status_code=400, detail="Pixel is outside the current screen resolution")
+            state.pixels[f"{pixel_x},{pixel_y}"] = str(color or "#000000")
+            state.image_data_uri = ""
+            return state
+
+    def set_image_data_uri(self, connection_id: str, image_data_uri: str) -> ScreenStateRecord:
+        cleaned = str(image_data_uri or "").strip()
+        if not cleaned.startswith("data:image/png"):
+            raise HTTPException(status_code=400, detail="Screen image must be a PNG data URI")
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            if state.mode != "pixels":
+                raise HTTPException(status_code=409, detail="Screen must be in pixels/image mode")
+            state.pixels.clear()
+            state.image_data_uri = cleaned
+            return state
+
+    def record_button_press(self, connection_id: str, object_id: str) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            state.pressed_button_ids.append(str(object_id or ""))
+            return state
+
+    def clear_pressed_buttons(self, connection_id: str) -> ScreenStateRecord:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            state.pressed_button_ids.clear()
+            return state
+
+    def serialize(self, connection_id: str) -> dict[str, Any]:
+        with self._lock:
+            state = self._get_or_create_locked(connection_id)
+            return {
+                "mode": state.mode,
+                "width": state.width,
+                "height": state.height,
+                "objects": [
+                    {
+                        "kind": item.kind,
+                        "id": item.object_id,
+                        "x": item.x,
+                        "y": item.y,
+                        "width": item.width,
+                        "height": item.height,
+                        "text": item.text,
+                        "background": item.background,
+                        "color": item.color,
+                        "fontSize": item.font_size,
+                    }
+                    for item in state.objects
+                ],
+                "analytics": [
+                    {
+                        "id": item.analytic_id,
+                        "name": item.name,
+                        "kind": item.kind,
+                        "value": item.value,
+                    }
+                    for item in state.analytics
+                ],
+                "pixels": state.pixels,
+                "imageDataUri": state.image_data_uri,
+                "pressedButtonIds": list(state.pressed_button_ids),
+            }
+
+
+class LocalAiManager:
+    def __init__(self, model_id: str = DEFAULT_AI_MODEL):
+        self.model_id = model_id
+        self._lock = threading.RLock()
+        self._tokenizer = None
+        self._model = None
+
+    def _ensure_loaded_locked(self) -> None:
+        if self._tokenizer is not None and self._model is not None:
+            return
+
+        try:
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="ScratchLink AI is not installed yet. Install the Python requirements and try again.",
+            ) from exc
+
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ScratchLink could not load the local AI model ({self.model_id}).",
+            ) from exc
+
+    def generate(self, prompt: str, instructions: str = "", json_format: str = "") -> dict[str, Any]:
+        cleaned_prompt = str(prompt or "").strip()
+        if not cleaned_prompt:
+            raise HTTPException(status_code=400, detail="An AI prompt is required")
+
+        cleaned_instructions = str(instructions or "").strip()
+        cleaned_json_format = str(json_format or "").strip()
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            tokenizer = self._tokenizer
+            model = self._model
+
+            system_parts = []
+            if cleaned_instructions:
+                system_parts.append(cleaned_instructions)
+            else:
+                system_parts.append("Be helpful, concise, and follow the user's instructions carefully.")
+            if cleaned_json_format:
+                system_parts.append(
+                    "Respond with only a valid JSON object and no extra text. "
+                    f"The JSON must match this format: {cleaned_json_format}"
+                )
+
+            combined_prompt = (
+                "Instructions:\n"
+                + "\n".join(system_parts)
+                + "\n\nUser prompt:\n"
+                + cleaned_prompt
+                + "\n\nResponse:"
+            )
+
+            inputs = tokenizer(
+                combined_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=768,
+            )
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                do_sample=False,
+                num_beams=4,
+                early_stopping=True,
+            )
+            response_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            return {
+                "ok": True,
+                "model": self.model_id,
+                "text": response_text,
+            }
+
+
 class RuntimeState:
     def __init__(self):
         self.store: ConnectionStore | None = None
@@ -400,6 +898,8 @@ class RuntimeState:
         self.public_base_url = ""
         self.admin_token = secrets.token_urlsafe(24)
         self.directory_host = DirectoryHost()
+        self.screen_manager = ScreenManager()
+        self.ai_manager = LocalAiManager()
 
     def require_store(self) -> ConnectionStore:
         if self.store is None:
@@ -499,6 +999,92 @@ class HostedRequestResponsePayload(BaseModel):
     status: int = 200
     headers: str = "{}"
     body: str = ""
+
+
+class OutboundHttpRequest(BaseModel):
+    url: str
+    headers: str = "{}"
+    body: str = ""
+
+
+class AiGenerateRequest(BaseModel):
+    prompt: str
+    instructions: str = ""
+    json_format: str = ""
+
+
+class ScreenModeRequest(BaseModel):
+    mode: str
+
+
+class ScreenResolutionRequest(BaseModel):
+    width: int
+    height: int
+
+
+class ScreenPixelRequest(BaseModel):
+    x: int
+    y: int
+    color: str = "#000000"
+
+
+class ScreenImageRequest(BaseModel):
+    data_uri: str
+
+
+class ScreenAnalyticCreateRequest(BaseModel):
+    object_id: str
+    name: str
+    value: str
+    kind: str = "value"
+
+
+class ScreenAnalyticUpdateRequest(BaseModel):
+    object_id: str
+    value: str
+
+
+class ScreenItemRemoveRequest(BaseModel):
+    object_id: str
+
+
+class ScreenButtonRequest(BaseModel):
+    object_id: str
+    text: str
+    x: int
+    y: int
+    width: int = 120
+    height: int = 40
+    background: str = "#ffffff"
+    color: str = "#17324d"
+
+
+class ScreenTextRequest(BaseModel):
+    object_id: str
+    text: str
+    x: int
+    y: int
+    color: str = "#17324d"
+    font_size: int = 18
+
+
+class ScreenTextUpdateRequest(BaseModel):
+    object_id: str
+    text: str
+
+
+class ScreenButtonTextUpdateRequest(BaseModel):
+    object_id: str
+    text: str
+
+
+class ScreenBoxRequest(BaseModel):
+    object_id: str
+    x: int
+    y: int
+    width: int
+    height: int
+    background: str = "#cccccc"
 
 
 app = FastAPI(title="ScratchLink")
@@ -1049,6 +1635,163 @@ def respond_to_hosted_request(payload: HostedRequestResponsePayload, connection:
     return {"ok": True, "requestId": record.request_id}
 
 
+@app.get("/screen-state")
+def get_screen_state(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    return STATE.screen_manager.serialize(connection.id)
+
+
+@app.post("/screen/clear")
+def clear_screen(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.clear_screen(connection.id)
+    return {"ok": True}
+
+
+@app.post("/screen/mode")
+def set_screen_mode(payload: ScreenModeRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    state = STATE.screen_manager.set_mode(connection.id, payload.mode)
+    return {"ok": True, "mode": state.mode}
+
+
+@app.post("/screen/resolution")
+def set_screen_resolution(payload: ScreenResolutionRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    state = STATE.screen_manager.set_resolution(connection.id, payload.width, payload.height)
+    return {"ok": True, "width": state.width, "height": state.height}
+
+
+@app.post("/screen/pixel")
+def set_screen_pixel(payload: ScreenPixelRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.set_pixel(connection.id, payload.x, payload.y, payload.color)
+    return {"ok": True}
+
+
+@app.post("/screen/image")
+def set_screen_image(payload: ScreenImageRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.set_image_data_uri(connection.id, payload.data_uri)
+    return {"ok": True}
+
+
+@app.post("/screen/analytic")
+def add_screen_analytic(payload: ScreenAnalyticCreateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.add_analytic(connection.id, payload.object_id, payload.name, payload.value, payload.kind)
+    return {"ok": True}
+
+
+@app.post("/screen/analytic/value")
+def update_screen_analytic_value(payload: ScreenAnalyticUpdateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.update_analytic_value(connection.id, payload.object_id, payload.value)
+    return {"ok": True}
+
+
+@app.post("/screen/analytic/remove")
+def remove_screen_analytic(payload: ScreenItemRemoveRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.remove_analytic(connection.id, payload.object_id)
+    return {"ok": True}
+
+
+@app.post("/screen/object/button")
+def add_screen_button(payload: ScreenButtonRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.add_button(
+        connection.id,
+        payload.object_id,
+        payload.text,
+        payload.x,
+        payload.y,
+        payload.width,
+        payload.height,
+        payload.background,
+        payload.color,
+    )
+    return {"ok": True}
+
+
+@app.post("/screen/object/text")
+def add_screen_text(payload: ScreenTextRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.add_text(
+        connection.id,
+        payload.object_id,
+        payload.text,
+        payload.x,
+        payload.y,
+        payload.color,
+        payload.font_size,
+    )
+    return {"ok": True}
+
+
+@app.post("/screen/object/text/update")
+def update_screen_text(payload: ScreenTextUpdateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.update_text(connection.id, payload.object_id, payload.text)
+    return {"ok": True}
+
+
+@app.post("/screen/object/button/update")
+def update_screen_button_text(payload: ScreenButtonTextUpdateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.update_button_text(connection.id, payload.object_id, payload.text)
+    return {"ok": True}
+
+
+@app.post("/screen/object/box")
+def add_screen_box(payload: ScreenBoxRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.add_box(
+        connection.id,
+        payload.object_id,
+        payload.x,
+        payload.y,
+        payload.width,
+        payload.height,
+        payload.background,
+    )
+    return {"ok": True}
+
+
+@app.post("/screen/object/remove")
+def remove_screen_object(payload: ScreenItemRemoveRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.remove_object(connection.id, payload.object_id)
+    return {"ok": True}
+
+
+@app.post("/http/get")
+def outbound_http_get(payload: OutboundHttpRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
+    return perform_outbound_http_request("GET", payload.url, parse_headers_json(payload.headers))
+
+
+@app.post("/http/post")
+def outbound_http_post(payload: OutboundHttpRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
+    return perform_outbound_http_request("POST", payload.url, parse_headers_json(payload.headers), payload.body)
+
+
+@app.post("/ai/generate")
+def ai_generate(payload: AiGenerateRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
+    return STATE.ai_manager.generate(payload.prompt, payload.instructions, payload.json_format)
+
+
+@app.get("/screen/buttons")
+def get_screen_pressed_buttons(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    return {"buttons": STATE.screen_manager.serialize(connection.id)["pressedButtonIds"]}
+
+
+@app.post("/screen/buttons/clear")
+def clear_screen_pressed_buttons(connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    STATE.screen_manager.clear_pressed_buttons(connection.id)
+    return {"ok": True}
+
+
+@app.get("/admin/screen/{connection_id}")
+def admin_get_screen_state(connection_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    get_store().require(connection_id)
+    return STATE.screen_manager.serialize(connection_id)
+
+
+@app.post("/admin/screen/{connection_id}/press/{object_id}")
+def admin_press_screen_button(connection_id: str, object_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    get_store().require(connection_id)
+    STATE.screen_manager.record_button_press(connection_id, object_id)
+    return {"ok": True}
+
+
 @app.api_route("/directory/{directory_name}", methods=["GET", "POST"])
 @app.api_route("/directory/{directory_name}/{request_path:path}", methods=["GET", "POST"])
 async def public_directory_request(directory_name: str, request: Request, request_path: str = "") -> Response:
@@ -1433,6 +2176,21 @@ def ensure_cloudflared(progress: Callable[[str], None] | None = None) -> str:
     raise RuntimeError("ScratchLink could not install Cloudflare Tunnel automatically.")
 
 
+def wait_for_public_hostname(url: str, timeout_seconds: float = 20.0) -> bool:
+    hostname = urlparse(str(url or "").strip()).hostname
+    if not hostname:
+        return False
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            socket.getaddrinfo(hostname, 443)
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
 class LocalServerController:
     def __init__(self, host: str, port: int):
         self.host = host
@@ -1484,50 +2242,58 @@ class TunnelController:
         return self._public_url
 
     def start(self, progress: Callable[[str], None] | None = None) -> str:
-        if progress:
-            progress("Opening a public Cloudflare URL for ScratchLink...")
+        for attempt in range(1, 4):
+            if progress:
+                progress(f"Opening a public Cloudflare URL for ScratchLink... (attempt {attempt}/3)")
 
-        command = [self.cloudflared_path, "tunnel", "--url", self.local_url, "--no-autoupdate"]
-        self._process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+            command = [self.cloudflared_path, "tunnel", "--url", self.local_url, "--no-autoupdate"]
+            self._process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
 
-        url_holder = {"url": None}
+            url_holder = {"url": None}
 
-        def collect() -> None:
-            if not self._process or not self._process.stdout:
-                return
-            for line in self._process.stdout:
-                text = line.strip()
-                if progress and text:
-                    lowered = text.lower()
-                    if "trycloudflare.com" in lowered or "registered" in lowered or "starting" in lowered:
-                        progress(text)
-                if "https://" in text and "trycloudflare.com" in text and not url_holder["url"]:
-                    for token in text.split():
-                        if token.startswith("https://") and "trycloudflare.com" in token:
-                            url_holder["url"] = token.rstrip("/")
-                            self._public_url = url_holder["url"]
-                            return
+            def collect() -> None:
+                if not self._process or not self._process.stdout:
+                    return
+                for line in self._process.stdout:
+                    text = line.strip()
+                    if progress and text:
+                        lowered = text.lower()
+                        if "trycloudflare.com" in lowered or "registered" in lowered or "starting" in lowered:
+                            progress(text)
+                    if "https://" in text and "trycloudflare.com" in text and not url_holder["url"]:
+                        for token in text.split():
+                            if token.startswith("https://") and "trycloudflare.com" in token:
+                                url_holder["url"] = token.rstrip("/")
+                                self._public_url = url_holder["url"]
+                                return
 
-        thread = threading.Thread(target=collect, daemon=True)
-        thread.start()
+            thread = threading.Thread(target=collect, daemon=True)
+            thread.start()
 
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if url_holder["url"]:
-                return url_holder["url"]
-            if self._process and self._process.poll() is not None:
-                break
-            time.sleep(0.3)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if url_holder["url"]:
+                    if wait_for_public_hostname(url_holder["url"]):
+                        return url_holder["url"]
+                    if progress:
+                        progress("Cloudflare gave ScratchLink a URL that is not reachable yet. Retrying...")
+                    break
+                if self._process and self._process.poll() is not None:
+                    break
+                time.sleep(0.3)
 
-        self.stop()
-        raise RuntimeError("ScratchLink could not open a Cloudflare URL.")
+            self.stop()
+            self._process = None
+            self._public_url = None
+
+        raise RuntimeError("ScratchLink could not open a working Cloudflare URL.")
 
     def stop(self) -> None:
         if self._process is None:

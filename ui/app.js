@@ -1,4 +1,6 @@
 const bootstrap = window.__SCRATCHLINK_BOOTSTRAP__ || {};
+const STATE_REFRESH_MS = 1500;
+const SCREEN_REFRESH_MS = 200;
 
 const elements = {
   heroStatus: document.getElementById('hero-status'),
@@ -11,15 +13,24 @@ const elements = {
   menuCloseButton: document.getElementById('menu-close-button'),
   menuToggleButton: document.getElementById('menu-toggle-button'),
   menuRenameButton: document.getElementById('menu-rename-button'),
+  menuViewScreenButton: document.getElementById('menu-view-screen-button'),
   menuCopyExtensionButton: document.getElementById('menu-copy-extension-button'),
   menuCopyLinkButton: document.getElementById('menu-copy-link-button'),
-  menuDeleteButton: document.getElementById('menu-delete-button')
+  menuDeleteButton: document.getElementById('menu-delete-button'),
+  screenOverlay: document.getElementById('screen-overlay'),
+  screenCloseButton: document.getElementById('screen-close-button'),
+  screenTitle: document.getElementById('screen-title'),
+  screenStage: document.getElementById('screen-stage'),
+  screenCanvas: document.getElementById('screen-canvas'),
+  screenObjects: document.getElementById('screen-objects')
 };
 
 let state = {
   connections: [],
-  menuConnectionId: null
+  menuConnectionId: null,
+  screenConnectionId: null
 };
+const previousAnalyticsValues = new Map();
 
 function adminHeaders() {
   return {
@@ -132,6 +143,245 @@ function closeMenu() {
   elements.menuOverlay.classList.add('hidden');
 }
 
+function openScreenViewer() {
+  const connection = getMenuConnection();
+  if (!connection) {
+    showToast('Choose a connection first.');
+    return;
+  }
+  state.screenConnectionId = connection.id;
+  elements.screenTitle.textContent = `${connection.name} Screen`;
+  elements.screenOverlay.classList.remove('hidden');
+  refreshScreenState().catch(handleError);
+}
+
+function closeScreenViewer() {
+  state.screenConnectionId = null;
+  elements.screenOverlay.classList.add('hidden');
+}
+
+async function refreshScreenState() {
+  if (!state.screenConnectionId) {
+    return;
+  }
+  const screen = await api(`/admin/screen/${state.screenConnectionId}`);
+  renderScreen(screen);
+}
+
+function renderScreen(screen) {
+  const mode = screen.mode || 'objects';
+  if (mode === 'pixels') {
+    renderPixelScreen(screen);
+  } else if (mode === 'analytics') {
+    renderAnalyticsScreen(screen);
+  } else {
+    renderObjectScreen(screen);
+  }
+}
+
+function renderObjectScreen(screen) {
+  elements.screenStage.classList.add('objects-mode');
+  elements.screenCanvas.classList.add('hidden');
+  elements.screenObjects.className = 'screen-objects';
+  elements.screenObjects.innerHTML = '';
+  elements.screenObjects.style.width = '640px';
+  elements.screenObjects.style.height = '420px';
+  elements.screenStage.style.width = '640px';
+  elements.screenStage.style.height = '420px';
+
+  (screen.objects || []).forEach((item) => {
+    let node;
+    if (item.kind === 'button') {
+      node = document.createElement('button');
+      node.className = 'screen-widget button';
+      node.textContent = item.text || item.id;
+      node.style.background = item.background || '#ffffff';
+      node.style.color = item.color || '#17324d';
+      node.addEventListener('click', () => pressScreenButton(item.id).catch(handleError));
+    } else if (item.kind === 'text') {
+      node = document.createElement('div');
+      node.className = 'screen-widget text';
+      node.textContent = item.text || '';
+      node.style.color = item.color || '#17324d';
+      node.style.fontSize = `${item.fontSize || 18}px`;
+    } else {
+      node = document.createElement('div');
+      node.className = 'screen-widget box';
+      node.style.background = item.background || '#cccccc';
+    }
+
+    node.style.left = `${item.x || 0}px`;
+    node.style.top = `${item.y || 0}px`;
+    if (item.width) {
+      node.style.width = `${item.width}px`;
+    }
+    if (item.height) {
+      node.style.height = `${item.height}px`;
+    }
+    elements.screenObjects.append(node);
+  });
+}
+
+function renderPixelScreen(screen) {
+  const imageDataUri = String(screen.imageDataUri || '').trim();
+  if (imageDataUri) {
+    renderImageScreen(imageDataUri, screen);
+    return;
+  }
+
+  const width = Math.max(1, Number(screen.width) || 64);
+  const height = Math.max(1, Number(screen.height) || 64);
+  const scale = Math.max(4, Math.floor(Math.min(720 / width, 520 / height, 12)));
+
+  elements.screenStage.classList.remove('objects-mode');
+  elements.screenCanvas.classList.remove('hidden');
+  elements.screenObjects.className = 'screen-objects';
+  elements.screenObjects.innerHTML = '';
+  elements.screenStage.style.width = `${width * scale}px`;
+  elements.screenStage.style.height = `${height * scale}px`;
+
+  const canvas = elements.screenCanvas;
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = `${width * scale}px`;
+  canvas.style.height = `${height * scale}px`;
+  canvas.style.imageRendering = 'pixelated';
+
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, width, height);
+  const pixels = screen.pixels || {};
+  Object.entries(pixels).forEach(([key, color]) => {
+    const [xText, yText] = key.split(',');
+    const x = Number(xText);
+    const y = Number(yText);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      context.fillStyle = color || '#000000';
+      context.fillRect(x, y, 1, 1);
+    }
+  });
+}
+
+function renderImageScreen(imageDataUri, screen) {
+  const fallbackWidth = Math.max(1, Number(screen.width) || 64);
+  const fallbackHeight = Math.max(1, Number(screen.height) || 64);
+
+  elements.screenStage.classList.remove('objects-mode');
+  elements.screenCanvas.classList.remove('hidden');
+  elements.screenObjects.className = 'screen-objects';
+  elements.screenObjects.innerHTML = '';
+
+  const canvas = elements.screenCanvas;
+  const context = canvas.getContext('2d');
+  canvas.width = fallbackWidth;
+  canvas.height = fallbackHeight;
+  context.clearRect(0, 0, fallbackWidth, fallbackHeight);
+
+  const image = new Image();
+  image.onload = () => {
+    const width = Math.max(1, image.naturalWidth || fallbackWidth);
+    const height = Math.max(1, image.naturalHeight || fallbackHeight);
+    const scale = Math.max(1, Math.floor(Math.min(720 / width, 520 / height, 12)));
+
+    elements.screenStage.style.width = `${width * scale}px`;
+    elements.screenStage.style.height = `${height * scale}px`;
+    canvas.width = width;
+    canvas.height = height;
+    canvas.style.width = `${width * scale}px`;
+    canvas.style.height = `${height * scale}px`;
+    canvas.style.imageRendering = 'pixelated';
+    context.clearRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+  };
+  image.onerror = () => {
+    const scale = Math.max(4, Math.floor(Math.min(720 / fallbackWidth, 520 / fallbackHeight, 12)));
+    elements.screenStage.style.width = `${fallbackWidth * scale}px`;
+    elements.screenStage.style.height = `${fallbackHeight * scale}px`;
+    canvas.style.width = `${fallbackWidth * scale}px`;
+    canvas.style.height = `${fallbackHeight * scale}px`;
+  };
+  image.src = imageDataUri;
+}
+
+function renderAnalyticsScreen(screen) {
+  elements.screenStage.classList.remove('objects-mode');
+  elements.screenCanvas.classList.add('hidden');
+  elements.screenObjects.innerHTML = '';
+  elements.screenObjects.className = 'screen-analytics';
+  elements.screenObjects.style.width = '100%';
+  elements.screenObjects.style.height = '100%';
+  elements.screenStage.style.width = '920px';
+  elements.screenStage.style.height = 'auto';
+
+  const analytics = screen.analytics || [];
+  if (!analytics.length) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = 'No analytics yet.';
+    elements.screenObjects.append(empty);
+    return;
+  }
+
+  analytics.forEach((item) => {
+    const card = document.createElement('div');
+    card.className = `analytics-card ${item.kind === 'progress' ? 'progress' : 'value'}`;
+
+    const name = document.createElement('div');
+    name.className = 'analytics-name';
+    name.textContent = item.name || item.id;
+
+    const value = document.createElement('div');
+    value.className = 'analytics-value';
+    if (item.kind === 'progress') {
+      const numericValue = Math.max(0, Math.min(100, Number(item.value) || 0));
+      value.textContent = `${numericValue}%`;
+    } else {
+      value.textContent = item.value || '';
+    }
+
+    const id = document.createElement('div');
+    id.className = 'analytics-id';
+    id.textContent = item.id || '';
+
+    card.append(name, value);
+    if (item.kind === 'progress') {
+      const numericValue = Math.max(0, Math.min(100, Number(item.value) || 0));
+      const previousValue = previousAnalyticsValues.has(item.id) ? previousAnalyticsValues.get(item.id) : numericValue;
+      const bar = document.createElement('div');
+      bar.className = 'analytics-progress';
+      const fill = document.createElement('div');
+      fill.className = 'analytics-progress-fill';
+      fill.style.width = `${previousValue}%`;
+      bar.append(fill);
+      card.append(bar);
+      requestAnimationFrame(() => {
+        fill.style.width = `${numericValue}%`;
+      });
+    }
+    card.append(id);
+    elements.screenObjects.append(card);
+    if (item.kind === 'progress') {
+      previousAnalyticsValues.set(item.id, Math.max(0, Math.min(100, Number(item.value) || 0)));
+    } else {
+      previousAnalyticsValues.delete(item.id);
+    }
+  });
+
+  const activeIds = new Set(analytics.filter((item) => item.kind === 'progress').map((item) => item.id));
+  Array.from(previousAnalyticsValues.keys()).forEach((id) => {
+    if (!activeIds.has(id)) {
+      previousAnalyticsValues.delete(id);
+    }
+  });
+}
+
+async function pressScreenButton(objectId) {
+  if (!state.screenConnectionId) {
+    return;
+  }
+  await api(`/admin/screen/${state.screenConnectionId}/press/${encodeURIComponent(objectId)}`, { method: 'POST' });
+  showToast(`Pressed ${objectId}.`);
+}
+
 async function refreshState() {
   const data = await api('/admin/state');
   state.connections = data.connections || [];
@@ -224,11 +474,24 @@ elements.menuOverlay.addEventListener('click', (event) => {
 });
 elements.menuToggleButton.addEventListener('click', () => toggleMenuConnection().catch(handleError));
 elements.menuRenameButton.addEventListener('click', () => renameMenuConnection().catch(handleError));
+elements.menuViewScreenButton.addEventListener('click', openScreenViewer);
 elements.menuCopyExtensionButton.addEventListener('click', () => copyMenuExtensionLink().catch(handleError));
 elements.menuCopyLinkButton.addEventListener('click', () => copyMenuConnectionLink().catch(handleError));
 elements.menuDeleteButton.addEventListener('click', () => deleteMenuConnection().catch(handleError));
+elements.screenCloseButton.addEventListener('click', closeScreenViewer);
+elements.screenOverlay.addEventListener('click', (event) => {
+  if (event.target === elements.screenOverlay) {
+    closeScreenViewer();
+  }
+});
 
 refreshState().catch(handleError);
 setInterval(() => {
   refreshState().catch(() => {});
-}, 2500);
+}, STATE_REFRESH_MS);
+
+setInterval(() => {
+  if (state.screenConnectionId) {
+    refreshScreenState().catch(() => {});
+  }
+}, SCREEN_REFRESH_MS);

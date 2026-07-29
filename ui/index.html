@@ -37,9 +37,28 @@
       <div class="menu-actions">
         <button class="ghost-button" id="menu-toggle-button">Turn On or Off</button>
         <button class="ghost-button" id="menu-rename-button">Rename</button>
+        <button class="ghost-button" id="menu-view-screen-button">View Screen</button>
         <button class="ghost-button" id="menu-copy-extension-button">Copy Extension Link</button>
         <button class="ghost-button" id="menu-copy-link-button">Copy Connection Link</button>
         <button class="danger-button" id="menu-delete-button">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="screen-overlay hidden" id="screen-overlay">
+    <div class="screen-shell">
+      <div class="screen-bar">
+        <div>
+          <p class="menu-kicker">Screen</p>
+          <h2 id="screen-title">Connection Screen</h2>
+        </div>
+        <button class="close-button" id="screen-close-button" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="screen-stage-wrap">
+        <div class="screen-stage objects-mode" id="screen-stage">
+          <canvas class="screen-canvas hidden" id="screen-canvas"></canvas>
+          <div class="screen-objects" id="screen-objects"></div>
+        </div>
       </div>
     </div>
   </div>

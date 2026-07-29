@@ -10,6 +10,8 @@
       this.password = "__SCRATCHLINK_PASSWORD__";
       this.connected = false;
       this.lastError = "";
+      this.lastHttpStatus = 0;
+      this.lastHttpHeaders = {};
       this.mode = "classic";
       this.buffer = [];
     }
@@ -246,7 +248,220 @@
           },
           {
             blockType: Scratch.BlockType.LABEL,
+            text: "Web Requests"
+          },
+          {
+            opcode: "httpGet",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "http GET [URL] headers [HEADERS]",
+            arguments: {
+              URL: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "https://example.com"
+              },
+              HEADERS: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "{}"
+              }
+            }
+          },
+          {
+            opcode: "httpPost",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "http POST [URL] headers [HEADERS] body [BODY]",
+            arguments: {
+              URL: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "https://example.com/api"
+              },
+              HEADERS: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "{\"Content-Type\":\"application/json\"}"
+              },
+              BODY: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "{\"hello\":\"world\"}"
+              }
+            }
+          },
+          {
+            opcode: "getLastHttpStatus",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "last http status"
+          },
+          {
+            opcode: "getLastHttpHeaders",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "last http headers"
+          },
+          {
+            blockType: Scratch.BlockType.LABEL,
+            text: "AI"
+          },
+          {
+            opcode: "askAi",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "ai prompt [PROMPT] instructions [INSTRUCTIONS]",
+            arguments: {
+              PROMPT: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "Write a short welcome message."
+              },
+              INSTRUCTIONS: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "Be clear and friendly."
+              }
+            }
+          },
+          {
+            blockType: Scratch.BlockType.LABEL,
             text: "Screen"
+          },
+          {
+            opcode: "setScreenMode",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "set screen mode [MODE]",
+            arguments: {
+              MODE: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "screenModes",
+                defaultValue: "objects"
+              }
+            }
+          },
+          {
+            opcode: "clearScreenSurface",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "clear screen"
+          },
+          {
+            opcode: "addScreenButton",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "add screen button id [ID] text [TEXT] x [X] y [Y] w [W] h [H]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "button-1" },
+              TEXT: { type: Scratch.ArgumentType.STRING, defaultValue: "Click me" },
+              X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 20 },
+              Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 20 },
+              W: { type: Scratch.ArgumentType.NUMBER, defaultValue: 120 },
+              H: { type: Scratch.ArgumentType.NUMBER, defaultValue: 40 }
+            }
+          },
+          {
+            opcode: "updateScreenButtonText",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "update screen button id [ID] text to [TEXT]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "button-1" },
+              TEXT: { type: Scratch.ArgumentType.STRING, defaultValue: "Updated button" }
+            }
+          },
+          {
+            opcode: "addScreenText",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "add screen text id [ID] text [TEXT] x [X] y [Y] size [SIZE]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "text-1" },
+              TEXT: { type: Scratch.ArgumentType.STRING, defaultValue: "Hello" },
+              X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 24 },
+              Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 90 },
+              SIZE: { type: Scratch.ArgumentType.NUMBER, defaultValue: 24 }
+            }
+          },
+          {
+            opcode: "updateScreenText",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "update screen text id [ID] to [TEXT]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "text-1" },
+              TEXT: { type: Scratch.ArgumentType.STRING, defaultValue: "Updated text" }
+            }
+          },
+          {
+            opcode: "addScreenBox",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "add screen box id [ID] x [X] y [Y] w [W] h [H] color [COLOR]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "box-1" },
+              X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 10 },
+              Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 10 },
+              W: { type: Scratch.ArgumentType.NUMBER, defaultValue: 50 },
+              H: { type: Scratch.ArgumentType.NUMBER, defaultValue: 50 },
+              COLOR: { type: Scratch.ArgumentType.STRING, defaultValue: "#cccccc" }
+            }
+          },
+          {
+            opcode: "removeScreenObject",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "remove screen object id [ID]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "box-1" }
+            }
+          },
+          {
+            opcode: "setScreenResolution",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "set screen resolution w [W] h [H]",
+            arguments: {
+              W: { type: Scratch.ArgumentType.NUMBER, defaultValue: 64 },
+              H: { type: Scratch.ArgumentType.NUMBER, defaultValue: 64 }
+            }
+          },
+          {
+            opcode: "setScreenPixel",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "set screen pixel x [X] y [Y] color [COLOR]",
+            arguments: {
+              X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              COLOR: { type: Scratch.ArgumentType.STRING, defaultValue: "#ff0000" }
+            }
+          },
+          {
+            opcode: "setScreenImage",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "set screen image png data uri [DATA]",
+            arguments: {
+              DATA: { type: Scratch.ArgumentType.STRING, defaultValue: "data:image/png;base64," }
+            }
+          },
+          {
+            opcode: "addScreenAnalytic",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "add analytic id [ID] type [TYPE] name [NAME] value [VALUE]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "fps" },
+              TYPE: { type: Scratch.ArgumentType.STRING, menu: "analyticTypes", defaultValue: "value" },
+              NAME: { type: Scratch.ArgumentType.STRING, defaultValue: "FPS" },
+              VALUE: { type: Scratch.ArgumentType.STRING, defaultValue: "60" }
+            }
+          },
+          {
+            opcode: "updateScreenAnalyticValue",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "update analytic id [ID] value to [VALUE]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "fps" },
+              VALUE: { type: Scratch.ArgumentType.STRING, defaultValue: "61" }
+            }
+          },
+          {
+            opcode: "removeScreenAnalytic",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "remove analytic id [ID]",
+            arguments: {
+              ID: { type: Scratch.ArgumentType.STRING, defaultValue: "fps" }
+            }
+          },
+          {
+            opcode: "getPressedScreenButtons",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "screen pressed buttons list"
+          },
+          {
+            opcode: "clearPressedScreenButtons",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "clear screen pressed buttons list"
           },
           {
             opcode: "getScreenInfo",
@@ -513,6 +728,14 @@
             acceptReporters: true,
             items: ["none", "ctrl", "shift", "alt", "win"]
           },
+          screenModes: {
+            acceptReporters: true,
+            items: ["objects", "pixels", "image", "analytics"]
+          },
+          analyticTypes: {
+            acceptReporters: true,
+            items: ["value", "progress"]
+          },
           runModes: {
             acceptReporters: true,
             items: ["classic", "buffer"]
@@ -747,6 +970,209 @@
       await this.safeCommand("/app/open", {
         name: String(args.APP || "").trim()
       });
+    }
+
+    async httpGet(args) {
+      try {
+        const data = await this.request("/http/get", {
+          method: "POST",
+          body: {
+            url: String(args.URL || "").trim(),
+            headers: String(args.HEADERS || "{}")
+          }
+        });
+        this.connected = true;
+        this.lastError = "";
+        this.lastHttpStatus = Number(data.status) || 0;
+        this.lastHttpHeaders = data.headers || {};
+        return String(data.body || "");
+      } catch (error) {
+        this.connected = false;
+        this.lastError = String(error);
+        this.lastHttpStatus = 0;
+        this.lastHttpHeaders = {};
+        return "";
+      }
+    }
+
+    async httpPost(args) {
+      try {
+        const data = await this.request("/http/post", {
+          method: "POST",
+          body: {
+            url: String(args.URL || "").trim(),
+            headers: String(args.HEADERS || "{}"),
+            body: String(args.BODY || "")
+          }
+        });
+        this.connected = true;
+        this.lastError = "";
+        this.lastHttpStatus = Number(data.status) || 0;
+        this.lastHttpHeaders = data.headers || {};
+        return String(data.body || "");
+      } catch (error) {
+        this.connected = false;
+        this.lastError = String(error);
+        this.lastHttpStatus = 0;
+        this.lastHttpHeaders = {};
+        return "";
+      }
+    }
+
+    getLastHttpStatus() {
+      return this.lastHttpStatus;
+    }
+
+    getLastHttpHeaders() {
+      try {
+        return JSON.stringify(this.lastHttpHeaders || {});
+      } catch (_error) {
+        return "{}";
+      }
+    }
+
+    async askAi(args) {
+      try {
+        const data = await this.request("/ai/generate", {
+          method: "POST",
+          body: {
+            prompt: String(args.PROMPT || ""),
+            instructions: String(args.INSTRUCTIONS || "")
+          }
+        });
+        this.connected = true;
+        this.lastError = "";
+        return String(data.text || "");
+      } catch (error) {
+        this.connected = false;
+        this.lastError = String(error);
+        return "";
+      }
+    }
+
+    async setScreenMode(args) {
+      await this.safeCommand("/screen/mode", {
+        mode: String(args.MODE || "").trim().toLowerCase()
+      });
+    }
+
+    async clearScreenSurface() {
+      await this.safeCommand("/screen/clear", {});
+    }
+
+    async addScreenButton(args) {
+      await this.safeCommand("/screen/object/button", {
+        object_id: String(args.ID || "").trim(),
+        text: String(args.TEXT || ""),
+        x: Math.floor(Cast.toNumber(args.X)),
+        y: Math.floor(Cast.toNumber(args.Y)),
+        width: Math.max(1, Math.floor(Cast.toNumber(args.W))),
+        height: Math.max(1, Math.floor(Cast.toNumber(args.H))),
+        background: "#ffffff",
+        color: "#17324d"
+      });
+    }
+
+    async updateScreenButtonText(args) {
+      await this.safeCommand("/screen/object/button/update", {
+        object_id: String(args.ID || "").trim(),
+        text: String(args.TEXT || "")
+      });
+    }
+
+    async addScreenText(args) {
+      await this.safeCommand("/screen/object/text", {
+        object_id: String(args.ID || "").trim(),
+        text: String(args.TEXT || ""),
+        x: Math.floor(Cast.toNumber(args.X)),
+        y: Math.floor(Cast.toNumber(args.Y)),
+        color: "#17324d",
+        font_size: Math.max(1, Math.floor(Cast.toNumber(args.SIZE)))
+      });
+    }
+
+    async updateScreenText(args) {
+      await this.safeCommand("/screen/object/text/update", {
+        object_id: String(args.ID || "").trim(),
+        text: String(args.TEXT || "")
+      });
+    }
+
+    async addScreenBox(args) {
+      await this.safeCommand("/screen/object/box", {
+        object_id: String(args.ID || "").trim(),
+        x: Math.floor(Cast.toNumber(args.X)),
+        y: Math.floor(Cast.toNumber(args.Y)),
+        width: Math.max(1, Math.floor(Cast.toNumber(args.W))),
+        height: Math.max(1, Math.floor(Cast.toNumber(args.H))),
+        background: String(args.COLOR || "#cccccc")
+      });
+    }
+
+    async removeScreenObject(args) {
+      await this.safeCommand("/screen/object/remove", {
+        object_id: String(args.ID || "").trim()
+      });
+    }
+
+    async setScreenResolution(args) {
+      await this.safeCommand("/screen/resolution", {
+        width: Math.max(1, Math.floor(Cast.toNumber(args.W))),
+        height: Math.max(1, Math.floor(Cast.toNumber(args.H)))
+      });
+    }
+
+    async setScreenPixel(args) {
+      await this.safeCommand("/screen/pixel", {
+        x: Math.floor(Cast.toNumber(args.X)),
+        y: Math.floor(Cast.toNumber(args.Y)),
+        color: String(args.COLOR || "#000000")
+      });
+    }
+
+    async setScreenImage(args) {
+      await this.safeCommand("/screen/image", {
+        data_uri: String(args.DATA || "")
+      });
+    }
+
+    async addScreenAnalytic(args) {
+      await this.safeCommand("/screen/analytic", {
+        object_id: String(args.ID || "").trim(),
+        kind: String(args.TYPE || "value").trim().toLowerCase(),
+        name: String(args.NAME || ""),
+        value: String(args.VALUE || "")
+      });
+    }
+
+    async updateScreenAnalyticValue(args) {
+      await this.safeCommand("/screen/analytic/value", {
+        object_id: String(args.ID || "").trim(),
+        value: String(args.VALUE || "")
+      });
+    }
+
+    async removeScreenAnalytic(args) {
+      await this.safeCommand("/screen/analytic/remove", {
+        object_id: String(args.ID || "").trim()
+      });
+    }
+
+    async getPressedScreenButtons() {
+      try {
+        const data = await this.request("/screen/buttons");
+        this.connected = true;
+        this.lastError = "";
+        return JSON.stringify(data.buttons || []);
+      } catch (error) {
+        this.connected = false;
+        this.lastError = String(error);
+        return "";
+      }
+    }
+
+    async clearPressedScreenButtons() {
+      await this.safeCommand("/screen/buttons/clear", {});
     }
 
     async getScreenInfo(args) {
