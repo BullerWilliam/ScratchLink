@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -20,7 +21,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse, unquote
 
 import mss
 import mss.tools
@@ -397,6 +398,85 @@ def perform_outbound_http_request(method: str, url: str, headers: dict[str, str]
         }
     except urllib.error.URLError as exc:
         raise HTTPException(status_code=502, detail=f"ScratchLink could not reach that URL: {exc.reason}") from exc
+
+
+def perform_google_search(text: str, search_type: str = "", site: str = "", must_contain: str = "") -> dict[str, Any]:
+    cleaned_text = str(text or "").strip()
+    if not cleaned_text:
+        raise HTTPException(status_code=400, detail="Google search text is required")
+
+    params: dict[str, str | int] = {
+        "hl": "en",
+        "num": 10,
+        "q": cleaned_text,
+    }
+
+    cleaned_type = str(search_type or "").strip().lower()
+    if cleaned_type:
+        type_aliases = {
+            "images": "isch",
+            "image": "isch",
+            "news": "nws",
+            "videos": "vid",
+            "video": "vid",
+            "shopping": "shop",
+            "books": "bks",
+        }
+        params["tbm"] = type_aliases.get(cleaned_type, cleaned_type)
+
+    cleaned_site = str(site or "").strip()
+    if cleaned_site:
+        params["as_sitesearch"] = cleaned_site
+
+    cleaned_must_contain = str(must_contain or "").strip()
+    if cleaned_must_contain:
+        params["as_epq"] = cleaned_must_contain
+
+    found_links: list[str] = []
+    seen_links: set[str] = set()
+    result_pattern = re.compile(r'href="/url\?q=([^"&]+)')
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    for start in range(0, 100, 10):
+        page_params = dict(params)
+        page_params["start"] = start
+        url = f"https://www.google.com/search?{urlencode(page_params)}"
+        request = urllib.request.Request(url, headers=headers, method="GET")
+
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                html = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Google search failed with status {exc.code}.") from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(status_code=502, detail="ScratchLink could not reach Google search right now.") from exc
+
+        page_had_new_link = False
+        for raw_link in result_pattern.findall(html):
+            link = unquote(raw_link).strip()
+            lowered = link.lower()
+            if not lowered.startswith(("http://", "https://")):
+                continue
+            if "google.com" in lowered or "googleusercontent.com" in lowered:
+                continue
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            found_links.append(link)
+            page_had_new_link = True
+            if len(found_links) >= 100:
+                return {"ok": True, "links": found_links}
+
+        if not page_had_new_link and start >= 20:
+            break
+
+    return {"ok": True, "links": found_links}
 
 
 @dataclass
@@ -1064,6 +1144,13 @@ class OutboundHttpRequest(BaseModel):
     url: str
     headers: str = "{}"
     body: str = ""
+
+
+class GoogleSearchRequest(BaseModel):
+    text: str
+    search_type: str = ""
+    site: str = ""
+    must_contain: str = ""
 
 
 class AiGenerateRequest(BaseModel):
@@ -1832,6 +1919,12 @@ def outbound_http_get(payload: OutboundHttpRequest, connection: ConnectionRecord
 def outbound_http_post(payload: OutboundHttpRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
     _ = connection
     return perform_outbound_http_request("POST", payload.url, parse_headers_json(payload.headers), payload.body)
+
+
+@app.post("/google/search")
+def google_search(payload: GoogleSearchRequest, connection: ConnectionRecord = Depends(require_connection)) -> dict[str, Any]:
+    _ = connection
+    return perform_google_search(payload.text, payload.search_type, payload.site, payload.must_contain)
 
 
 @app.post("/ai/generate")

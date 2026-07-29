@@ -295,6 +295,29 @@
             text: "last http headers"
           },
           {
+            opcode: "googleSearch",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "google search [TEXT] type [TYPE] site [SITE] must contain [MUSTCONTAIN]",
+            arguments: {
+              TEXT: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "Scratch programming"
+              },
+              TYPE: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: ""
+              },
+              SITE: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: ""
+              },
+              MUSTCONTAIN: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: ""
+              }
+            }
+          },
+          {
             blockType: Scratch.BlockType.LABEL,
             text: "AI"
           },
@@ -1036,6 +1059,27 @@
         return JSON.stringify(this.lastHttpHeaders || {});
       } catch (_error) {
         return "{}";
+      }
+    }
+
+    async googleSearch(args) {
+      try {
+        const data = await this.request("/google/search", {
+          method: "POST",
+          body: {
+            text: String(args.TEXT || ""),
+            search_type: String(args.TYPE || ""),
+            site: String(args.SITE || ""),
+            must_contain: String(args.MUSTCONTAIN || "")
+          }
+        });
+        this.connected = true;
+        this.lastError = "";
+        return JSON.stringify(data.links || []);
+      } catch (error) {
+        this.connected = false;
+        this.lastError = String(error);
+        return "[]";
       }
     }
 
