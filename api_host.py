@@ -375,18 +375,26 @@ class GoogleResultLinkParser(HTMLParser):
 
 def extract_google_result_links(html: str) -> list[str]:
     parser = GoogleResultLinkParser()
-    parser.feed(str(html or ""))
+    source_html = str(html or "")
+    parser.feed(source_html)
 
     extracted: list[str] = []
     seen: set[str] = set()
 
-    for href in parser.links:
-        candidate = href
-        parsed_href = urlparse(href)
-        if href.startswith("/url?"):
+    raw_candidates = list(parser.links)
+    raw_candidates.extend(re.findall(r'href="/url\?(?:[^"]*?[?&])?q=([^"&]+)', source_html))
+    raw_candidates.extend(re.findall(r'"url":"(https?:\\/\\/[^"]+)"', source_html))
+    raw_candidates.extend(re.findall(r'"link":"(https?:\\/\\/[^"]+)"', source_html))
+    raw_candidates.extend(re.findall(r'"target":"(https?:\\/\\/[^"]+)"', source_html))
+
+    for href in raw_candidates:
+        candidate = str(href or "").replace("\\u0026", "&").replace("\\/", "/")
+        parsed_href = urlparse(candidate)
+        hostname = (parsed_href.hostname or "").lower()
+        if candidate.startswith("/url?") or (hostname.endswith("google.com") and parsed_href.path == "/url"):
             parsed_query = parse_qs(parsed_href.query)
             candidate = parsed_query.get("q", parsed_query.get("url", [""]))[0]
-        elif href.startswith("/imgres?"):
+        elif candidate.startswith("/imgres?") or (hostname.endswith("google.com") and parsed_href.path == "/imgres"):
             parsed_query = parse_qs(parsed_href.query)
             candidate = parsed_query.get("imgurl", [""])[0]
 
@@ -394,7 +402,9 @@ def extract_google_result_links(html: str) -> list[str]:
         lowered = candidate.lower()
         if not lowered.startswith(("http://", "https://")):
             continue
-        if "google.com" in lowered or "googleusercontent.com" in lowered:
+        parsed_candidate = urlparse(candidate)
+        candidate_host = (parsed_candidate.hostname or "").lower()
+        if candidate_host.endswith("google.com") or candidate_host.endswith("googleusercontent.com"):
             continue
         if candidate in seen:
             continue
