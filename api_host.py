@@ -373,19 +373,21 @@ class GoogleResultLinkParser(HTMLParser):
             self.links.append(href)
 
 
-def extract_google_result_links(html: str) -> list[str]:
+def extract_search_links(html: str, source_name: str) -> list[str]:
     parser = GoogleResultLinkParser()
     source_html = str(html or "")
-    parser.feed(source_html)
+    with suppress(Exception):
+        parser.feed(source_html)
 
     extracted: list[str] = []
     seen: set[str] = set()
 
     raw_candidates = list(parser.links)
-    raw_candidates.extend(re.findall(r'href="/url\?(?:[^"]*?[?&])?q=([^"&]+)', source_html))
-    raw_candidates.extend(re.findall(r'"url":"(https?:\\/\\/[^"]+)"', source_html))
-    raw_candidates.extend(re.findall(r'"link":"(https?:\\/\\/[^"]+)"', source_html))
-    raw_candidates.extend(re.findall(r'"target":"(https?:\\/\\/[^"]+)"', source_html))
+    if source_name == "google":
+        raw_candidates.extend(re.findall(r'href="/url\?(?:[^"]*?[?&])?q=([^"&]+)', source_html))
+        raw_candidates.extend(re.findall(r'"url":"(https?:\\/\\/[^"]+)"', source_html))
+        raw_candidates.extend(re.findall(r'"link":"(https?:\\/\\/[^"]+)"', source_html))
+        raw_candidates.extend(re.findall(r'"target":"(https?:\\/\\/[^"]+)"', source_html))
 
     for href in raw_candidates:
         candidate = str(href or "").replace("\\u0026", "&").replace("\\/", "/")
@@ -397,14 +399,32 @@ def extract_google_result_links(html: str) -> list[str]:
         elif candidate.startswith("/imgres?") or (hostname.endswith("google.com") and parsed_href.path == "/imgres"):
             parsed_query = parse_qs(parsed_href.query)
             candidate = parsed_query.get("imgurl", [""])[0]
-
+        elif source_name == "bing" and hostname.endswith("bing.com") and parsed_href.path == "/ck/a":
+            parsed_query = parse_qs(parsed_href.query)
+            candidate = parsed_query.get("u", [""])[0]
+        elif source_name == "duckduckgo" and hostname.endswith("duckduckgo.com") and parsed_href.path.startswith("/l/"):
+            parsed_query = parse_qs(parsed_href.query)
+            candidate = parsed_query.get("uddg", [""])[0]
         candidate = unquote(str(candidate or "")).strip()
         lowered = candidate.lower()
         if not lowered.startswith(("http://", "https://")):
             continue
         parsed_candidate = urlparse(candidate)
         candidate_host = (parsed_candidate.hostname or "").lower()
-        if candidate_host.endswith("google.com") or candidate_host.endswith("googleusercontent.com"):
+        candidate_path = (parsed_candidate.path or "").lower()
+        if (
+            candidate_host.endswith("google.com")
+            or candidate_host.endswith("googleusercontent.com")
+            or candidate_host.endswith("bing.com")
+            or candidate_host.endswith("duckduckgo.com")
+            or candidate_host.endswith("search.yahoo.com")
+            or candidate_host.endswith("w3.org")
+            or candidate_host.endswith("schemas.live.com")
+            or candidate_host.endswith("storage.live.com")
+            or candidate_host.endswith("challenges.cloudflare.com")
+        ):
+            continue
+        if candidate_path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2")):
             continue
         if candidate in seen:
             continue
@@ -412,6 +432,23 @@ def extract_google_result_links(html: str) -> list[str]:
         extracted.append(candidate)
 
     return extracted
+
+
+def fetch_search_html(url: str, headers: dict[str, str]) -> str:
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def build_search_cache_key(text: str, search_type: str, site: str, must_contain: str) -> str:
+    return "\n".join(
+        [
+            str(text or "").strip(),
+            str(search_type or "").strip().lower(),
+            str(site or "").strip().lower(),
+            str(must_contain or "").strip().lower(),
+        ]
+    )
 
 
 def perform_outbound_http_request(method: str, url: str, headers: dict[str, str], body: str = "") -> dict[str, Any]:
@@ -460,6 +497,7 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
     cleaned_text = str(text or "").strip()
     if not cleaned_text:
         raise HTTPException(status_code=400, detail="Google search text is required")
+    cache_key = build_search_cache_key(cleaned_text, search_type, site, must_contain)
 
     params: dict[str, str | int] = {
         "hl": "en",
@@ -490,8 +528,6 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
     if cleaned_must_contain:
         params["as_epq"] = cleaned_must_contain
 
-    found_links: list[str] = []
-    seen_links: set[str] = set()
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -500,26 +536,47 @@ def perform_google_search(text: str, search_type: str = "", site: str = "", must
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    url = f"https://www.google.com/search?{urlencode(params)}"
-    request = urllib.request.Request(url, headers=headers, method="GET")
+    query_text = cleaned_text
+    if cleaned_site:
+        query_text = f"{query_text} site:{cleaned_site}"
+    if cleaned_must_contain:
+        query_text = f'{query_text} "{cleaned_must_contain}"'
 
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            html = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Google search failed with status {exc.code}.") from exc
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail="ScratchLink could not reach Google search right now.") from exc
+    search_urls: list[tuple[str, str]] = [
+        ("google", f"https://www.google.com/search?{urlencode(params)}"),
+        ("bing", f"https://www.bing.com/search?{urlencode({'q': query_text, 'count': 100})}"),
+        ("duckduckgo", f"https://duckduckgo.com/html/?{urlencode({'q': query_text})}"),
+    ]
 
-    for link in extract_google_result_links(html):
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-        found_links.append(link)
-        if len(found_links) >= 100:
-            break
+    last_network_error: Exception | None = None
+    for _attempt in range(2):
+        for source_name, url in search_urls:
+            try:
+                html = fetch_search_html(url, headers)
+            except urllib.error.HTTPError as exc:
+                last_network_error = exc
+                continue
+            except urllib.error.URLError as exc:
+                last_network_error = exc
+                continue
 
-    return {"ok": True, "links": found_links}
+            links = extract_search_links(html, source_name)
+            if links:
+                trimmed_links = links[:100]
+                STATE.search_cache[cache_key] = (time.time(), trimmed_links)
+                return {"ok": True, "links": trimmed_links}
+        time.sleep(0.6)
+
+    cached = STATE.search_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_links = cached
+        if time.time() - cached_at <= 900 and cached_links:
+            return {"ok": True, "links": list(cached_links)}
+
+    if last_network_error is not None:
+        raise HTTPException(status_code=502, detail="ScratchLink could not reach search right now.") from last_network_error
+
+    return {"ok": True, "links": []}
 
 
 @dataclass
@@ -1071,12 +1128,14 @@ class RuntimeState:
     def __init__(self):
         self.store: ConnectionStore | None = None
         self.extension_template = ""
+        self.extension_version = str(int(time.time()))
         self.local_base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
         self.public_base_url = ""
         self.admin_token = secrets.token_urlsafe(24)
         self.directory_host = DirectoryHost()
         self.screen_manager = ScreenManager()
         self.ai_manager = HostedAiManager()
+        self.search_cache: dict[str, tuple[float, list[str]]] = {}
 
     def require_store(self) -> ConnectionStore:
         if self.store is None:
@@ -1316,7 +1375,7 @@ def build_extension_script(connection: ConnectionRecord) -> str:
 
 def make_extension_url(connection: ConnectionRecord, base_url: str | None = None) -> str:
     base = (base_url or STATE.api_base_url()).rstrip("/")
-    return f"{base}/extension/{connection.id}.js?password={quote(connection.password)}"
+    return f"{base}/extension/{connection.id}.js?password={quote(connection.password)}&v={quote(STATE.extension_version)}"
 
 
 def get_store() -> ConnectionStore:
@@ -2055,11 +2114,16 @@ def health(connection: ConnectionRecord = Depends(require_connection)) -> dict[s
 
 
 @app.get("/extension/{connection_id}.js")
-def extension_js(connection_id: str, password: str = Query(default="")) -> PlainTextResponse:
+def extension_js(connection_id: str, password: str = Query(default=""), v: str = Query(default="")) -> PlainTextResponse:
+    _ = v
     connection = get_store().require(connection_id)
     if not password or not secrets.compare_digest(connection.password, password):
         raise HTTPException(status_code=403, detail="The extension password is invalid")
-    return PlainTextResponse(build_extension_script(connection), media_type="application/javascript")
+    response = PlainTextResponse(build_extension_script(connection), media_type="application/javascript")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/screen")
